@@ -15,7 +15,12 @@ pip install -r requirements.txt
 ```
 
 ### 2.2 安装 OpenHarness CLI
-推荐：
+推荐（更干净，不污染当前环境）：
+```bash
+uv tool install git+https://github.com/HKUDS/OpenHarness.git
+```
+
+备选（如果没有 uv）：
 ```bash
 pip install git+https://github.com/HKUDS/OpenHarness.git
 ```
