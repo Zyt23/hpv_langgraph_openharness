@@ -1,0 +1,47 @@
+paths:
+  data_root: ../hpv
+  artifacts_root: ../_outputs
+  run_name: hpv_openharness_benchmark
+  knowledge_globs:
+    - ../*.pdf
+    - ../*.docx
+    - ../*.md
+    - ../*.txt
+
+openharness:
+  enabled: true
+  command: openharness
+  model: z-ai/glm-5.1
+  timeout_sec: 180
+  max_retries: 2
+
+split:
+  seed: 42
+  train_aircraft_count: 10
+
+agent_tools:
+  observe_max_steps: 8
+  hypothesize_max_steps: 8
+  inspect_max_rows: 4000
+  test_flights_per_label: 20
+
+loop:
+  max_rounds: 12
+  observation_flights_per_class: 10
+  validation_windows_per_class: 10
+  folder_vote_threshold: 0.5
+  target_f1_class1: 0.80
+  patience_rounds: 3
+  min_improvement: 0.02
+  tool_eval_max_flights_per_folder: 20
+  validation_max_flights_per_folder: 20
+  final_eval_max_flights_per_folder: 0
+
+features:
+  min_segment_len: 60
+  min_rows_per_window: 60
+  profile_quantiles: [0.05, 0.5, 0.95]
+
+runtime:
+  workspace_subdir: workspace
+  cache_subdir: cache

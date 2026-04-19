@@ -1,0 +1,16 @@
+# Local data folders
+hpv/**
+
+# Environment variables
+.env
+
+# Parquet data files
+*.parquet
+
+# Runtime outputs and local caches
+_outputs/
+.openharness/
+
+# Python cache
+__pycache__/
+*.pyc
