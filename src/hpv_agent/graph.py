@@ -13,6 +13,7 @@ from .config import AppConfig
 from .indexing import build_aircraft_index, build_split_manifest
 from .knowledge_base import build_knowledge_index
 from .metrics import classify_folder_units, format_metrics_table, summarize_folder_metrics
+from .preflight import check_openharness_connectivity
 from .schema import ConditionSpec, RuleBundle
 from .state import WorkflowState
 from .workers import choose_condition, propose_rule, reflect
@@ -22,6 +23,23 @@ def bootstrap_node(state: WorkflowState) -> WorkflowState:
     t0 = time.perf_counter()
     cfg = AppConfig.from_yaml(state["config_path"])
     run_dir = ensure_dir(Path(state["run_dir_override"])) if state.get("run_dir_override") else ensure_dir(cfg.run_dir)
+    preflight_workspace = ensure_dir(run_dir / cfg.runtime.workspace_subdir / "preflight")
+    try:
+        preflight = check_openharness_connectivity(cfg, preflight_workspace)
+        save_json(run_dir / "preflight_openharness.json", preflight)
+        print(
+            f"[preflight] ok={preflight.get('ok')} elapsed={preflight.get('elapsed_sec', 0)}s "
+            f"model={preflight.get('model', '')}",
+            flush=True,
+        )
+    except Exception as e:
+        err = {"ok": False, "error": str(e)}
+        save_json(run_dir / "preflight_openharness.json", err)
+        raise RuntimeError(
+            "OpenHarness preflight failed. "
+            "Please check API key/network/proxy before running full workflow. "
+            f"error={e}"
+        )
     shared_cache_dir = ensure_dir(cfg.paths.artifacts_root / "_shared_cache")
     data_key = hashlib.md5(str(cfg.paths.data_root.resolve()).encode("utf-8")).hexdigest()[:12]
     split_key = hashlib.md5(f"{data_key}|{cfg.split.seed}|{cfg.split.train_aircraft_count}".encode("utf-8")).hexdigest()[:12]
@@ -210,10 +228,11 @@ def reflect_node(state: WorkflowState) -> WorkflowState:
 
     hard_stop = False
     hard_reason = ""
+    max_rounds = int(state.get("max_rounds_override", 0)) or cfg.loop.max_rounds
     if best_f1 >= cfg.loop.target_f1_class1:
         hard_stop = True
         hard_reason = f"class1_f1_reached_target_{cfg.loop.target_f1_class1}"
-    elif int(state["current_round"]) >= cfg.loop.max_rounds:
+    elif int(state["current_round"]) >= max_rounds:
         hard_stop = True
         hard_reason = "max_rounds_reached"
     elif plateau >= cfg.loop.patience_rounds:

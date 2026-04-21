@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
 from pathlib import Path
 import time
@@ -16,22 +17,50 @@ from .schema import ConditionSpec, HypothesizeAction, KnowledgeRequest, ObserveA
 
 
 MECHANISM_PROMPT = """
-HPV故障前兆分类计划 - A320引气系统（必须遵守）
-数据组织：
-- 文件夹命名：B-{飞机号}-HPV-{故障序号}-{故障侧(1=左/2=右)}
-- 每个飞机文件夹下有 0 与 1 子文件夹。0=健康/远离故障，1=退化/接近故障。
-列语义：
-- 左侧(1)：N21, (PUD1或BMPS1), PRECOOL_PRESS1, HPV_ENG1_R
-- 右侧(2)：N22, (PUD2或BMPS2), PRECOOL_PRESS2, HPV_ENG2_R
-- 通用：FLIGHT_PHASE, LATP, LONP, ALT_STD, time_group, TAIL_NUM
-关键约束：
-- BMPS 与 PUD 同侧只会存在一个，读取后必须自动识别。
-- 读取策略是“全列读取+按需选飞机/航班”；不要假设手工预先汇总。
-- 工况筛选和规则允许你给出可执行表达式代码（表达式会由程序执行并返回结果）。
-机制倾向：
-- 关注故障侧与健康侧差异（pressure_diff / hpv_diff / precool_diff）及其绝对值。
-- 关注HPV开关状态和压力/转速的耦合异常，而不是单变量孤立阈值。
-- FLIGHT_PHASE、ALT_STD、time_group可以用于限定工况窗口，避免全航段混杂。
+HPV precursor classification plan for A320 bleed system (must follow).
+
+Data organization
+- Folder naming: B-aircraft_id-HPV-fault_seq-fault_side, where fault_side: 1=left, 2=right.
+- Each aircraft folder has two labels: 0 and 1.
+  - 0: healthy / far from fault.
+  - 1: degraded / close to fault.
+
+Column semantics
+- Left side (1):
+  - N21: engine rotational speed.
+  - PUD1 or BMPS1 (exactly one exists): transmission duct pressure.
+  - PRECOOL_PRESS1: main manifold pressure.
+  - HPV_ENG1_R: bleed valve open state (0=closed, 1=open; angle unknown).
+- Right side (2):
+  - N22: engine rotational speed.
+  - PUD2 or BMPS2 (exactly one exists): transmission duct pressure.
+  - PRECOOL_PRESS2: main manifold pressure.
+  - HPV_ENG2_R: bleed valve open state (0=closed, 1=open; angle unknown).
+- Common:
+  - FLIGHT_PHASE: flight phase code.
+  - LATP: latitude.
+  - LONP: longitude.
+  - ALT_STD: standard-pressure altitude.
+  - time_group: segment index within a flight.
+  - TAIL_NUM: aircraft registration identifier.
+- Data format:
+  - All columns are float32 in parquet storage.
+  - One parquet file equals one flight, typically about 4,000 to 15,000 rows.
+
+Hard constraints
+- On each side, only one of PUD or BMPS may exist. The program must auto-detect it.
+- Read strategy: read full columns from selected flights only. Do not preload all data.
+- Condition expressions are Python-style boolean expressions executed by the program.
+
+Mechanism preference
+- Focus on fault-vs-healthy asymmetry: pressure_diff, hpv_diff, precool_diff and abs variants.
+- Prefer coupled anomalies (HPV state with pressure/speed), not isolated single-variable thresholds.
+- Use FLIGHT_PHASE, ALT_STD, time_group to constrain operating windows and reduce confounding.
+
+Convergence policy
+- When evidence is sufficient, finalize_condition promptly. Avoid repeated list_aircraft loops.
+- If at least one inspect_flight and one test_condition are done, and both labels are covered in windows,
+  prefer finalize_condition.
 """
 
 
@@ -70,6 +99,78 @@ def _compact_trace_for_prompt(trace_items: list[dict]) -> list[dict]:
             row["result_summary"] = rr
         compact.append(row)
     return compact
+
+
+def _trace_action_list(trace_items: list[dict]) -> list[str]:
+    actions = []
+    for item in trace_items:
+        action = str(item.get("decision", {}).get("action", "")).strip()
+        if not action:
+            continue
+        if action.startswith("bootstrap_probe_") or action.startswith("model_call_"):
+            continue
+        actions.append(action)
+    return actions
+
+
+def _consecutive_tail_count(actions: list[str], target: str) -> int:
+    n = 0
+    for a in reversed(actions):
+        if a != target:
+            break
+        n += 1
+    return n
+
+
+def _last_trace_item(trace_items: list[dict], action: str) -> dict | None:
+    for item in reversed(trace_items):
+        if item.get("decision", {}).get("action") == action:
+            return item
+    return None
+
+
+def _progress_summary_for_observe(trace_items: list[dict]) -> dict:
+    actions = _trace_action_list(trace_items)
+    cnt = Counter(actions)
+    last_test = _last_trace_item(trace_items, "test_condition")
+    last_windows = None
+    last_windows_per_label = {}
+    last_test_spec = None
+    if last_test:
+        r = last_test.get("result", {}) if isinstance(last_test.get("result", {}), dict) else {}
+        last_windows = r.get("n_windows")
+        last_windows_per_label = r.get("windows_per_label", {}) if isinstance(r.get("windows_per_label", {}), dict) else {}
+        if isinstance(r.get("condition_spec"), dict):
+            last_test_spec = r.get("condition_spec")
+    return {
+        "counts": dict(cnt),
+        "consecutive_list_aircraft": _consecutive_tail_count(actions, "list_aircraft"),
+        "has_list_flights": cnt.get("list_flights", 0) > 0,
+        "has_inspect_flight": cnt.get("inspect_flight", 0) > 0,
+        "has_test_condition": cnt.get("test_condition", 0) > 0,
+        "last_test_n_windows": last_windows,
+        "last_test_windows_per_label": last_windows_per_label,
+        "last_test_condition_spec": last_test_spec,
+    }
+
+
+def _progress_summary_for_hypothesize(trace_items: list[dict]) -> dict:
+    actions = _trace_action_list(trace_items)
+    cnt = Counter(actions)
+    last_test = _last_trace_item(trace_items, "test_rule")
+    last_metrics = {}
+    if last_test:
+        r = last_test.get("result", {}) if isinstance(last_test.get("result", {}), dict) else {}
+        if isinstance(r.get("metrics"), dict):
+            last_metrics = r.get("metrics")
+    return {
+        "counts": dict(cnt),
+        "consecutive_list_aircraft": _consecutive_tail_count(actions, "list_aircraft"),
+        "has_list_flights": cnt.get("list_flights", 0) > 0,
+        "has_inspect_flight": cnt.get("inspect_flight", 0) > 0,
+        "has_test_rule": cnt.get("test_rule", 0) > 0,
+        "last_test_metrics": last_metrics,
+    }
 
 
 def _split_aircraft(split_manifest: dict, split: str) -> list[str]:
@@ -252,7 +353,17 @@ def choose_condition(
         min_segment_len=cfg.features.min_segment_len,
     )
     for _ in range(cfg.agent_tools.observe_max_steps):
-        print(f"[observe-worker] round={round_no} step_start", flush=True)
+        compact_trace = _compact_trace_for_prompt(trace[-6:])
+        progress = _progress_summary_for_observe(trace)
+        print(f"[observe-worker] round={round_no} step_start trace_steps={len(trace)}", flush=True)
+        print(
+            f"[observe-worker] progress counts={progress.get('counts', {})} "
+            f"consecutive_list_aircraft={progress.get('consecutive_list_aircraft', 0)} "
+            f"has_inspect={progress.get('has_inspect_flight')} "
+            f"has_test={progress.get('has_test_condition')} "
+            f"last_test_n_windows={progress.get('last_test_n_windows')}",
+            flush=True,
+        )
         prompt = (
             "You are in OBSERVE stage. Decide one tool action now.\n"
             "Return ObserveAction JSON only.\n\n"
@@ -260,18 +371,52 @@ def choose_condition(
             "Allowed actions: list_aircraft, list_flights, inspect_flight, test_condition, finalize_condition.\n"
             "All tool calls must stay on training split only.\n"
             "For inspect_flight/test_condition, you must first choose aircraft and flights via tools.\n"
+            "Action policy:\n"
+            "- Do not repeat list_aircraft if you already listed aircraft once.\n"
+            "- After list_flights, prefer inspect_flight.\n"
+            "- After inspect_flight and test_condition with both labels covered, prefer finalize_condition.\n"
             "Condition expression must be a Python-style expression over row-context aliases, such as:\n"
             "(affected_n2 > 60) & (healthy_n2 > 60) & (phase >= 2) & (phase <= 8) & (altitude > 1000)\n\n"
             f"knowledge_context={json.dumps(kn, ensure_ascii=False)}\n"
-            f"last_trace={json.dumps(_compact_trace_for_prompt(trace[-6:]), ensure_ascii=False)}\n"
+            f"progress_summary={json.dumps(progress, ensure_ascii=False)}\n"
+            f"last_trace={json.dumps(compact_trace, ensure_ascii=False)}\n"
         )
         try:
             t_call = time.perf_counter()
+            print(f"[observe-worker] model_call prompt_chars={len(prompt)}", flush=True)
             decision = run_openharness_structured(prompt, ObserveAction, cfg, workspace)
-            print(f"[observe-worker] model_decision={decision.action} in {time.perf_counter()-t_call:.1f}s", flush=True)
+            decision_info = {
+                "action": decision.action,
+                "aircraft_id": decision.aircraft_id,
+                "folder_label": decision.folder_label,
+                "max_items": decision.max_items,
+                "flight_path": decision.flight_path,
+                "n_aircraft_ids": len(decision.aircraft_ids or []),
+                "has_condition_spec": decision.condition_spec is not None,
+            }
+            print(
+                f"[observe-worker] model_decision={json.dumps(decision_info, ensure_ascii=False)} "
+                f"in {time.perf_counter()-t_call:.1f}s",
+                flush=True,
+            )
         except Exception as e:
             trace.append({"decision": {"action": "model_call_observe"}, "result": {"error": str(e)}})
             break
+        # Anti-loop correction: avoid repeated list_aircraft when evidence already exists.
+        if decision.action == "list_aircraft" and int(progress.get("consecutive_list_aircraft", 0)) >= 2:
+            if progress.get("has_inspect_flight") and progress.get("has_test_condition"):
+                tested = progress.get("last_test_condition_spec")
+                decision.action = "finalize_condition"
+                decision.condition_spec = ConditionSpec.model_validate(tested) if isinstance(tested, dict) else default_spec
+                decision.note = "auto_finalize_after_repeated_list_aircraft"
+                print("[observe-worker] auto_override list_aircraft -> finalize_condition", flush=True)
+            else:
+                decision.action = "inspect_flight"
+                decision.aircraft_id = decision.aircraft_id or _split_aircraft(split_manifest, "train")[0]
+                decision.folder_label = int(decision.folder_label) if int(decision.folder_label) in (0, 1) else 1
+                decision.max_items = 1
+                decision.note = "auto_inspect_after_repeated_list_aircraft"
+                print("[observe-worker] auto_override list_aircraft -> inspect_flight", flush=True)
         try:
             if decision.action == "list_aircraft":
                 result = _tool_list_aircraft(index_df, split_manifest, "train")
@@ -337,13 +482,25 @@ def propose_rule(
         rationale="Fallback rule from pressure asymmetry and HPV opening behavior.",
     )
     for _ in range(cfg.agent_tools.hypothesize_max_steps):
-        print(f"[hypothesize-worker] round={round_no} step_start", flush=True)
+        compact_trace = _compact_trace_for_prompt(trace[-6:])
+        progress = _progress_summary_for_hypothesize(trace)
+        print(f"[hypothesize-worker] round={round_no} step_start trace_steps={len(trace)}", flush=True)
+        print(
+            f"[hypothesize-worker] progress counts={progress.get('counts', {})} "
+            f"consecutive_list_aircraft={progress.get('consecutive_list_aircraft', 0)} "
+            f"has_inspect={progress.get('has_inspect_flight')} "
+            f"has_test={progress.get('has_test_rule')}",
+            flush=True,
+        )
         prompt = (
             "You are in HYPOTHESIZE stage. Decide one tool action now.\n"
             "Return HypothesizeAction JSON only.\n\n"
             f"{MECHANISM_PROMPT}\n"
             "Allowed actions: list_aircraft, list_flights, inspect_flight, test_rule, finalize_rule.\n"
             "All tool calls must stay on training split only.\n"
+            "Action policy:\n"
+            "- Do not repeat list_aircraft if you already listed aircraft once.\n"
+            "- After inspect_flight and test_rule, prefer finalize_rule with a concrete rule_bundle.\n"
             "Rule uses window feature columns. score_expression can be numeric or boolean.\n"
             "If numeric, window predicted as class1 when score_expression >= decision_threshold.\n"
             "Examples:\n"
@@ -352,15 +509,42 @@ def propose_rule(
             f"fixed_condition_spec={json.dumps(condition_spec.model_dump(), ensure_ascii=False)}\n"
             f"knowledge_context={json.dumps(kn, ensure_ascii=False)}\n"
             f"history={json.dumps(history[-5:], ensure_ascii=False)}\n"
-            f"last_trace={json.dumps(_compact_trace_for_prompt(trace[-6:]), ensure_ascii=False)}\n"
+            f"progress_summary={json.dumps(progress, ensure_ascii=False)}\n"
+            f"last_trace={json.dumps(compact_trace, ensure_ascii=False)}\n"
         )
         try:
             t_call = time.perf_counter()
+            print(f"[hypothesize-worker] model_call prompt_chars={len(prompt)}", flush=True)
             decision = run_openharness_structured(prompt, HypothesizeAction, cfg, workspace)
-            print(f"[hypothesize-worker] model_decision={decision.action} in {time.perf_counter()-t_call:.1f}s", flush=True)
+            decision_info = {
+                "action": decision.action,
+                "aircraft_id": decision.aircraft_id,
+                "folder_label": decision.folder_label,
+                "max_items": decision.max_items,
+                "flight_path": decision.flight_path,
+                "n_aircraft_ids": len(decision.aircraft_ids or []),
+                "has_rule_bundle": decision.rule_bundle is not None,
+            }
+            print(
+                f"[hypothesize-worker] model_decision={json.dumps(decision_info, ensure_ascii=False)} "
+                f"in {time.perf_counter()-t_call:.1f}s",
+                flush=True,
+            )
         except Exception as e:
             trace.append({"decision": {"action": "model_call_hypothesize"}, "result": {"error": str(e)}})
             break
+        if decision.action == "list_aircraft" and int(progress.get("consecutive_list_aircraft", 0)) >= 2:
+            if progress.get("has_test_rule"):
+                decision.action = "finalize_rule"
+                decision.rule_bundle = decision.rule_bundle or default_rule
+                decision.note = "auto_finalize_after_repeated_list_aircraft"
+                print("[hypothesize-worker] auto_override list_aircraft -> finalize_rule", flush=True)
+            else:
+                decision.action = "test_rule"
+                decision.aircraft_ids = decision.aircraft_ids or _split_aircraft(split_manifest, "train")[:4]
+                decision.rule_bundle = decision.rule_bundle or default_rule
+                decision.note = "auto_test_rule_after_repeated_list_aircraft"
+                print("[hypothesize-worker] auto_override list_aircraft -> test_rule", flush=True)
         try:
             if decision.action == "list_aircraft":
                 result = _tool_list_aircraft(index_df, split_manifest, "train")

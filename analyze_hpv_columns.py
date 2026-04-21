@@ -27,7 +27,10 @@ def _long_path(path: Path) -> str:
 
 def _iter_parquet(root: Path) -> Iterable[Path]:
     for p in root.rglob("*.parquet"):
-        yield p
+        # Expected layout: <root>/<aircraft_id>/<label>/<flight>.parquet
+        # Ignore label "2" for now, only audit 0/1.
+        if len(p.parts) >= 2 and p.parent.name in {"0", "1"}:
+            yield p
 
 
 def _has_side(cols: set[str], core: set[str], pressure_candidates: set[str]) -> bool:

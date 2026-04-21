@@ -6,6 +6,7 @@ from typing import Any, Dict, List, TypedDict
 class WorkflowState(TypedDict, total=False):
     config_path: str
     run_dir_override: str
+    max_rounds_override: int
     run_dir: str
     aircraft_index_path: str
     split_manifest_path: str

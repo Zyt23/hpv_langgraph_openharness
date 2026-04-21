@@ -20,6 +20,7 @@ class OpenHarnessConfig(BaseModel):
     model: str = "openai/gpt-4.1-mini"
     timeout_sec: int = 180
     max_retries: int = 2
+    preflight_timeout_sec: int = 20
 
 
 class AgentToolLoopConfig(BaseModel):

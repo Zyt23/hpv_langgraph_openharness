@@ -24,6 +24,7 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--resume-run", default="", help="Resume a previous run by directory name under artifacts_root")
     parser.add_argument("--run-suffix", default="", help="Optional suffix for a new run directory name")
+    parser.add_argument("--max-rounds", type=int, default=0, help="Override max rounds for this run (0 means use config)")
     args = parser.parse_args()
 
     cfg = AppConfig.from_yaml(args.config)
@@ -48,6 +49,7 @@ def main() -> None:
         {
             "config_path": str(Path(args.config).resolve()),
             "run_dir_override": str(run_dir_override),
+            "max_rounds_override": int(args.max_rounds) if args.max_rounds and args.max_rounds > 0 else 0,
         }
     )
     if result.get("metrics_table_path"):
