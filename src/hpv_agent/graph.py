@@ -19,6 +19,16 @@ from .state import WorkflowState
 from .workers import choose_condition, propose_rule, reflect
 
 
+def _inner_validation_aircraft(split_manifest: dict) -> tuple[list[str], list[str]]:
+    train = list(split_manifest["train_aircraft"])
+    if len(train) <= 3:
+        return train, train
+    n_val = max(2, min(3, len(train) // 3))
+    inner_val = train[-n_val:]
+    inner_train = train[:-n_val]
+    return inner_train, inner_val
+
+
 def bootstrap_node(state: WorkflowState) -> WorkflowState:
     t0 = time.perf_counter()
     cfg = AppConfig.from_yaml(state["config_path"])
@@ -169,34 +179,38 @@ def validate_node(state: WorkflowState) -> WorkflowState:
     index_df = pd.read_parquet(state["aircraft_index_path"])
     split_manifest = load_json(state["split_manifest_path"])
     rule = RuleBundle.model_validate(load_json(state["candidate_rule_path"]))
+    inner_train, inner_val = _inner_validation_aircraft(split_manifest)
 
     print(
         f"[validate] round={int(state['current_round'])} "
         f"max_flights_per_folder={cfg.loop.validation_max_flights_per_folder}"
     )
-    training_preds = classify_folder_units(
+    train_preds = classify_folder_units(
         index_df,
-        split_manifest["train_aircraft"],
+        inner_train,
         rule,
         cfg,
         max_flights_per_folder=cfg.loop.validation_max_flights_per_folder,
         verbose=True,
-        tag="validate_train",
+        tag="validate_train_inner",
     )
     val_preds = classify_folder_units(
         index_df,
-        split_manifest["holdout_aircraft"],
+        inner_val,
         rule,
         cfg,
         max_flights_per_folder=cfg.loop.validation_max_flights_per_folder,
         verbose=True,
-        tag="validate_val",
+        tag="validate_val_inner",
     )
     report = {
-        "training": summarize_folder_metrics(training_preds),
+        "training": summarize_folder_metrics(train_preds),
         "val": summarize_folder_metrics(val_preds),
-        "n_training_units": len(training_preds),
+        "n_training_units": len(train_preds),
         "n_val_units": len(val_preds),
+        "inner_train_aircraft": inner_train,
+        "inner_val_aircraft": inner_val,
+        "note": "validate 阶段只在训练飞机内部做 inner-train/inner-val 评估；holdout_aircraft 只留给 final_test。",
     }
     validation_report_path = round_dir / "validation_report.json"
     save_json(validation_report_path, report)
@@ -302,20 +316,20 @@ def final_test_node(state: WorkflowState) -> WorkflowState:
         verbose=True,
         tag="final_train",
     )
-    val_preds = classify_folder_units(
+    holdout_preds = classify_folder_units(
         index_df,
         split_manifest["holdout_aircraft"],
         rule,
         cfg,
         max_flights_per_folder=cfg.loop.final_eval_max_flights_per_folder,
         verbose=True,
-        tag="final_val",
+        tag="final_holdout",
     )
     training_metrics = summarize_folder_metrics(training_preds)
-    val_metrics = summarize_folder_metrics(val_preds)
+    holdout_metrics = summarize_folder_metrics(holdout_preds)
     save_json(run_dir / "training_eval.json", training_metrics)
-    save_json(run_dir / "val_eval.json", val_metrics)
-    metrics_txt = format_metrics_table({"training": training_metrics, "val": val_metrics})
+    save_json(run_dir / "holdout_eval.json", holdout_metrics)
+    metrics_txt = format_metrics_table({"training": training_metrics, "holdout": holdout_metrics})
     metrics_table_path = run_dir / "metrics_table.txt"
     metrics_table_path.write_text(metrics_txt, encoding="utf-8")
     print(f"[final_test] done in {time.perf_counter()-t0:.1f}s")

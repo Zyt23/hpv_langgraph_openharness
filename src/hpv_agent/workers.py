@@ -26,42 +26,32 @@ Data organization
   - 1: degraded / close to fault.
 
 Column semantics
-- Left side (1):
-  - N21: engine rotational speed.
-  - PUD1 or BMPS1 (exactly one exists): transmission duct pressure.
-  - PRECOOL_PRESS1: main manifold pressure.
-  - HPV_ENG1_R: bleed valve open state (0=closed, 1=open; angle unknown).
-- Right side (2):
-  - N22: engine rotational speed.
-  - PUD2 or BMPS2 (exactly one exists): transmission duct pressure.
-  - PRECOOL_PRESS2: main manifold pressure.
-  - HPV_ENG2_R: bleed valve open state (0=closed, 1=open; angle unknown).
-- Common:
-  - FLIGHT_PHASE: flight phase code.
-  - LATP: latitude.
-  - LONP: longitude.
-  - ALT_STD: standard-pressure altitude.
-  - time_group: segment index within a flight.
-  - TAIL_NUM: aircraft registration identifier.
-- Data format:
-  - All columns are float32 in parquet storage.
-  - One parquet file equals one flight, typically about 4,000 to 15,000 rows.
+- Left side (1): N21, PUD1 or BMPS1, PRECOOL_PRESS1, HPV_ENG1_R.
+- Right side (2): N22, PUD2 or BMPS2, PRECOOL_PRESS2, HPV_ENG2_R.
+- Common: FLIGHT_PHASE, LATP, LONP, ALT_STD, time_group, TAIL_NUM.
+- Program already normalizes raw columns into row-context aliases.
 
 Hard constraints
-- On each side, only one of PUD or BMPS may exist. The program must auto-detect it.
+- On each side, only one of PUD or BMPS may exist. The program auto-detects it.
 - Read strategy: read full columns from selected flights only. Do not preload all data.
 - Condition expressions are Python-style boolean expressions executed by the program.
+- During the observe stage, you are selecting an informative operating condition only, not the final classifier rule.
+- Do NOT use time_group, TAIL_NUM, LATP, LONP as discriminative evidence.
+- phase / altitude can be used to gate the operating regime, but should not dominate the later rule.
 
 Mechanism preference
 - Focus on fault-vs-healthy asymmetry: pressure_diff, hpv_diff, precool_diff and abs variants.
 - Prefer coupled anomalies (HPV state with pressure/speed), not isolated single-variable thresholds.
-- Use FLIGHT_PHASE, ALT_STD, time_group to constrain operating windows and reduce confounding.
+- Use FLIGHT_PHASE and ALT_STD to constrain operating windows and reduce confounding.
 
 Convergence policy
-- When evidence is sufficient, finalize_condition promptly. Avoid repeated list_aircraft loops.
-- If at least one inspect_flight and one test_condition are done, and both labels are covered in windows,
-  prefer finalize_condition.
+- A condition is only trustworthy if it works on multiple aircraft, preferably covering both fault sides.
+- Do not finalize after a single-aircraft condition test.
+- After at least one inspect_flight and one cross-aircraft test_condition with both labels covered, prefer finalize_condition.
 """
+
+LEAKY_PREFIXES = ("time_group__", "tail_num__", "lat__", "lon__")
+GATING_PREFIXES = ("phase__", "altitude__")
 
 
 def plan_knowledge(cfg: AppConfig, task_name: str, task_context: dict, knowledge_index: dict, workspace: str) -> list[dict]:
@@ -93,7 +83,18 @@ def _compact_trace_for_prompt(trace_items: list[dict]) -> list[dict]:
                 row[k] = d.get(k)
         if isinstance(r, dict):
             rr = {}
-            for k in ["n_aircraft", "n_flights", "n_rows", "n_windows", "n_folder_units", "windows_per_label", "metrics", "error"]:
+            for k in [
+                "n_aircraft",
+                "n_flights",
+                "n_rows",
+                "n_windows",
+                "n_folder_units",
+                "windows_per_label",
+                "n_aircraft_sampled",
+                "n_aircraft_with_windows",
+                "metrics",
+                "error",
+            ]:
                 if k in r:
                     rr[k] = r.get(k)
             row["result_summary"] = rr
@@ -136,10 +137,12 @@ def _progress_summary_for_observe(trace_items: list[dict]) -> dict:
     last_windows = None
     last_windows_per_label = {}
     last_test_spec = None
+    last_test_aircraft_n = None
     if last_test:
         r = last_test.get("result", {}) if isinstance(last_test.get("result", {}), dict) else {}
         last_windows = r.get("n_windows")
         last_windows_per_label = r.get("windows_per_label", {}) if isinstance(r.get("windows_per_label", {}), dict) else {}
+        last_test_aircraft_n = r.get("n_aircraft_with_windows")
         if isinstance(r.get("condition_spec"), dict):
             last_test_spec = r.get("condition_spec")
     return {
@@ -151,6 +154,7 @@ def _progress_summary_for_observe(trace_items: list[dict]) -> dict:
         "last_test_n_windows": last_windows,
         "last_test_windows_per_label": last_windows_per_label,
         "last_test_condition_spec": last_test_spec,
+        "last_test_n_aircraft_with_windows": last_test_aircraft_n,
     }
 
 
@@ -177,8 +181,29 @@ def _split_aircraft(split_manifest: dict, split: str) -> list[str]:
     if split == "train":
         return split_manifest["train_aircraft"]
     if split == "val":
-        return split_manifest["holdout_aircraft"]
-    return sorted(set(split_manifest["train_aircraft"] + split_manifest["holdout_aircraft"]))
+        return split_manifest.get("holdout_aircraft", [])
+    return sorted(set(split_manifest["train_aircraft"] + split_manifest.get("holdout_aircraft", [])))
+
+
+def _balanced_train_aircraft(index_df: pd.DataFrame, split_manifest: dict, min_n: int = 4) -> list[str]:
+    train_ids = _split_aircraft(split_manifest, "train")
+    sub = index_df[index_df["aircraft_id"].isin(train_ids)]
+    left = list(dict.fromkeys(sub[sub["faulty_side"] == "left"]["aircraft_id"].tolist()))
+    right = list(dict.fromkeys(sub[sub["faulty_side"] == "right"]["aircraft_id"].tolist()))
+    out: list[str] = []
+    for a, b in zip(left, right):
+        if a not in out:
+            out.append(a)
+        if b not in out:
+            out.append(b)
+        if len(out) >= min_n:
+            return out[:min_n]
+    for aid in train_ids:
+        if aid not in out:
+            out.append(aid)
+        if len(out) >= min_n:
+            break
+    return out[:min_n]
 
 
 def _tool_list_aircraft(index_df: pd.DataFrame, split_manifest: dict, split: str) -> dict:
@@ -233,7 +258,18 @@ def _tool_inspect_flight(
     if max_rows > 0 and len(row_ctx) > max_rows:
         row_ctx = row_ctx.iloc[:max_rows].copy()
     stats = {}
-    for col in ["affected_n2", "healthy_n2", "affected_pressure", "healthy_pressure", "affected_hpv", "healthy_hpv", "pressure_abs_diff", "precool_abs_diff", "altitude", "phase"]:
+    for col in [
+        "affected_n2",
+        "healthy_n2",
+        "affected_pressure",
+        "healthy_pressure",
+        "affected_hpv",
+        "healthy_hpv",
+        "pressure_abs_diff",
+        "precool_abs_diff",
+        "altitude",
+        "phase",
+    ]:
         s = pd.to_numeric(row_ctx[col], errors="coerce").dropna()
         if s.empty:
             continue
@@ -255,16 +291,35 @@ def _tool_inspect_flight(
     }
 
 
+def _filter_top_features(rows: list[dict]) -> list[dict]:
+    out = []
+    for row in rows:
+        feat = str(row.get("feature", ""))
+        if feat.startswith(LEAKY_PREFIXES):
+            continue
+        if feat.startswith(GATING_PREFIXES):
+            continue
+        out.append(row)
+    return out
+
+
 def _test_condition_on_aircraft(index_df: pd.DataFrame, aircraft_ids: list[str], cfg: AppConfig, spec: ConditionSpec) -> dict:
+    # Cross-aircraft, balanced sampling: at most one flight per label per aircraft.
     sub = index_df[index_df["aircraft_id"].isin(aircraft_ids)]
     windows = []
     sampled_flights = []
-    for label in [0, 1]:
-        rows = sub[sub["folder_label"] == label].head(cfg.agent_tools.test_flights_per_label).to_dict(orient="records")
-        for row in rows:
-            sampled_flights.append({"aircraft_id": row["aircraft_id"], "folder_label": int(row["folder_label"]), "flight_path": row["flight_path"]})
-            windows.extend(
-                extract_windows_for_flight(
+    windows_per_aircraft = {}
+    for aircraft_id in aircraft_ids:
+        sub_a = sub[sub["aircraft_id"] == aircraft_id]
+        for label in [0, 1]:
+            rows = sub_a[sub_a["folder_label"] == label].head(1).to_dict(orient="records")
+            for row in rows:
+                sampled_flights.append({
+                    "aircraft_id": row["aircraft_id"],
+                    "folder_label": int(row["folder_label"]),
+                    "flight_path": row["flight_path"],
+                })
+                ws = extract_windows_for_flight(
                     row["flight_path"],
                     int(row["folder_label"]),
                     row["aircraft_id"],
@@ -273,19 +328,27 @@ def _test_condition_on_aircraft(index_df: pd.DataFrame, aircraft_ids: list[str],
                     cfg.features.min_segment_len,
                     spec,
                 )
-            )
+                windows.extend(ws)
+                windows_per_aircraft.setdefault(aircraft_id, {0: 0, 1: 0})
+                windows_per_aircraft[aircraft_id][int(row["folder_label"])] += len(ws)
     df = windows_to_frame(windows)
-    top = summarize_window_features(df, top_k=12)
+    top = summarize_window_features(df, top_k=20)
     label_counts = {}
+    aircraft_with_windows = set()
     if not df.empty:
         cnt = df["folder_label"].value_counts().to_dict()
         label_counts = {int(k): int(v) for k, v in cnt.items()}
+        aircraft_with_windows = set(df["aircraft_id"].astype(str).tolist())
     return {
         "condition_spec": spec.model_dump(),
         "n_windows": int(len(df)),
         "windows_per_label": label_counts,
+        "n_aircraft_sampled": int(len(aircraft_ids)),
+        "n_aircraft_with_windows": int(len(aircraft_with_windows)),
+        "windows_per_aircraft": windows_per_aircraft,
         "sampled_flights": sampled_flights,
-        "top_features": top.get("top_features", []),
+        "top_features": _filter_top_features(top.get("top_features", [])),
+        "excluded_feature_prefixes": list(LEAKY_PREFIXES + GATING_PREFIXES),
     }
 
 
@@ -315,7 +378,6 @@ def choose_condition(
 ) -> tuple[ConditionSpec, dict]:
     kn = plan_knowledge(cfg, "observe_condition", {"round_no": round_no}, knowledge_index, workspace)
     trace: list[dict] = []
-    # Deterministic bootstrap probe: guarantees at least one real parquet inspection attempt.
     try:
         probe_aircraft = _tool_list_aircraft(index_df, split_manifest, "train")
         trace.append({"decision": {"action": "bootstrap_probe_list_aircraft", "split": "train"}, "result": probe_aircraft})
@@ -348,8 +410,8 @@ def choose_condition(
         trace.append({"decision": {"action": "bootstrap_probe"}, "result": {"error": str(e)}})
     default_spec = ConditionSpec(
         name="baseline_operating_window",
-        description="Fallback condition when tool loop does not finalize.",
-        expression="(affected_n2 > 55) & (healthy_n2 > 55) & (phase >= 2) & (phase <= 9)",
+        description="Fallback condition: stable non-ground operating window for later rule mining.",
+        expression="(phase >= 2) & (phase <= 8) & (altitude > 1000) & (affected_n2 > 50) & (healthy_n2 > 50)",
         min_segment_len=cfg.features.min_segment_len,
     )
     for _ in range(cfg.agent_tools.observe_max_steps):
@@ -370,11 +432,13 @@ def choose_condition(
             f"{MECHANISM_PROMPT}\n"
             "Allowed actions: list_aircraft, list_flights, inspect_flight, test_condition, finalize_condition.\n"
             "All tool calls must stay on training split only.\n"
-            "For inspect_flight/test_condition, you must first choose aircraft and flights via tools.\n"
-            "Action policy:\n"
-            "- Do not repeat list_aircraft if you already listed aircraft once.\n"
-            "- After list_flights, prefer inspect_flight.\n"
-            "- After inspect_flight and test_condition with both labels covered, prefer finalize_condition.\n"
+            "observe stage goal: propose an informative operating condition, not a classifier rule.\n"
+            "Tool policy:\n"
+            "- list_aircraft is only for initial orientation; do not keep repeating it.\n"
+            "- inspect_flight should inspect a small number of representative flights from different aircraft / sides.\n"
+            "- test_condition must use multiple aircraft_ids, preferably >= 3 and covering both fault sides when possible.\n"
+            "- Do NOT finalize a condition after testing only one aircraft.\n"
+            "- top_features may include leakage if you misuse time_group/tail_num/lat/lon; avoid that.\n"
             "Condition expression must be a Python-style expression over row-context aliases, such as:\n"
             "(affected_n2 > 60) & (healthy_n2 > 60) & (phase >= 2) & (phase <= 8) & (altitude > 1000)\n\n"
             f"knowledge_context={json.dumps(kn, ensure_ascii=False)}\n"
@@ -402,17 +466,16 @@ def choose_condition(
         except Exception as e:
             trace.append({"decision": {"action": "model_call_observe"}, "result": {"error": str(e)}})
             break
-        # Anti-loop correction: avoid repeated list_aircraft when evidence already exists.
-        if decision.action == "list_aircraft" and int(progress.get("consecutive_list_aircraft", 0)) >= 2:
-            if progress.get("has_inspect_flight") and progress.get("has_test_condition"):
-                tested = progress.get("last_test_condition_spec")
-                decision.action = "finalize_condition"
-                decision.condition_spec = ConditionSpec.model_validate(tested) if isinstance(tested, dict) else default_spec
-                decision.note = "auto_finalize_after_repeated_list_aircraft"
-                print("[observe-worker] auto_override list_aircraft -> finalize_condition", flush=True)
+        if decision.action == "list_aircraft" and int(progress.get("consecutive_list_aircraft", 0)) >= 1:
+            if progress.get("has_inspect_flight"):
+                decision.action = "test_condition"
+                decision.aircraft_ids = _balanced_train_aircraft(index_df, split_manifest, min_n=4)
+                decision.condition_spec = progress.get("last_test_condition_spec") and ConditionSpec.model_validate(progress["last_test_condition_spec"]) or default_spec
+                decision.note = "auto_test_after_repeated_list_aircraft"
+                print("[observe-worker] auto_override list_aircraft -> test_condition", flush=True)
             else:
                 decision.action = "inspect_flight"
-                decision.aircraft_id = decision.aircraft_id or _split_aircraft(split_manifest, "train")[0]
+                decision.aircraft_id = decision.aircraft_id or _balanced_train_aircraft(index_df, split_manifest, min_n=1)[0]
                 decision.folder_label = int(decision.folder_label) if int(decision.folder_label) in (0, 1) else 1
                 decision.max_items = 1
                 decision.note = "auto_inspect_after_repeated_list_aircraft"
@@ -440,11 +503,26 @@ def choose_condition(
                     cfg.agent_tools.inspect_max_rows,
                 )
             elif decision.action == "test_condition":
-                aircraft_ids = decision.aircraft_ids or _split_aircraft(split_manifest, "train")[:3]
                 spec = decision.condition_spec or default_spec
+                aircraft_ids = decision.aircraft_ids or _balanced_train_aircraft(index_df, split_manifest, min_n=4)
+                if len(aircraft_ids) < 3:
+                    extra = _balanced_train_aircraft(index_df, split_manifest, min_n=4)
+                    aircraft_ids = list(dict.fromkeys(list(aircraft_ids) + extra))[:4]
                 result = _test_condition_on_aircraft(index_df, aircraft_ids, cfg, spec)
             elif decision.action == "finalize_condition":
                 spec = decision.condition_spec or default_spec
+                last_test = _last_trace_item(trace, "test_condition")
+                if last_test:
+                    r = last_test.get("result", {})
+                    enough_aircraft = int(r.get("n_aircraft_with_windows", 0)) >= 2
+                    both_labels = set(map(int, (r.get("windows_per_label", {}) or {}).keys())) == {0, 1}
+                    if not (enough_aircraft and both_labels):
+                        trace.append({
+                            "decision": decision.model_dump(),
+                            "result": {"error": "finalize_condition_blocked_due_to_insufficient_cross_aircraft_or_label_coverage"},
+                        })
+                        print("[observe-worker] blocked finalize_condition due to weak evidence", flush=True)
+                        continue
                 return spec, {"tool_trace": trace, "final_note": decision.note}
             else:
                 result = {"error": f"Unsupported action {decision.action}"}
@@ -476,10 +554,10 @@ def propose_rule(
     default_rule = RuleBundle(
         condition_spec=condition_spec,
         rule_name="fallback_rule",
-        score_expression="pressure_abs_diff__p95 * 0.5 + (1.0 - affected_hpv_open_ratio)",
+        score_expression="pressure_abs_diff__p95 * 0.5 + precool_abs_diff__mean * 0.3 + (1.0 - affected_hpv_open_ratio) * 0.2",
         decision_threshold=0.8,
         folder_vote_threshold=cfg.loop.folder_vote_threshold,
-        rationale="Fallback rule from pressure asymmetry and HPV opening behavior.",
+        rationale="Fallback rule from pressure asymmetry, precool asymmetry, and HPV opening behavior.",
     )
     for _ in range(cfg.agent_tools.hypothesize_max_steps):
         compact_trace = _compact_trace_for_prompt(trace[-6:])
@@ -500,6 +578,9 @@ def propose_rule(
             "All tool calls must stay on training split only.\n"
             "Action policy:\n"
             "- Do not repeat list_aircraft if you already listed aircraft once.\n"
+            "- The operating condition is fixed; do not rewrite it here.\n"
+            "- Avoid using time_group/tail_num/lat/lon in score_expression.\n"
+            "- Prefer pressure/precool/hpv-related window features.\n"
             "- After inspect_flight and test_rule, prefer finalize_rule with a concrete rule_bundle.\n"
             "Rule uses window feature columns. score_expression can be numeric or boolean.\n"
             "If numeric, window predicted as class1 when score_expression >= decision_threshold.\n"
@@ -533,7 +614,7 @@ def propose_rule(
         except Exception as e:
             trace.append({"decision": {"action": "model_call_hypothesize"}, "result": {"error": str(e)}})
             break
-        if decision.action == "list_aircraft" and int(progress.get("consecutive_list_aircraft", 0)) >= 2:
+        if decision.action == "list_aircraft" and int(progress.get("consecutive_list_aircraft", 0)) >= 1:
             if progress.get("has_test_rule"):
                 decision.action = "finalize_rule"
                 decision.rule_bundle = decision.rule_bundle or default_rule
@@ -541,7 +622,7 @@ def propose_rule(
                 print("[hypothesize-worker] auto_override list_aircraft -> finalize_rule", flush=True)
             else:
                 decision.action = "test_rule"
-                decision.aircraft_ids = decision.aircraft_ids or _split_aircraft(split_manifest, "train")[:4]
+                decision.aircraft_ids = decision.aircraft_ids or _balanced_train_aircraft(index_df, split_manifest, min_n=4)
                 decision.rule_bundle = decision.rule_bundle or default_rule
                 decision.note = "auto_test_rule_after_repeated_list_aircraft"
                 print("[hypothesize-worker] auto_override list_aircraft -> test_rule", flush=True)
@@ -570,7 +651,7 @@ def propose_rule(
             elif decision.action == "test_rule":
                 rule = decision.rule_bundle or default_rule
                 rule.condition_spec = condition_spec
-                aircraft_ids = decision.aircraft_ids or _split_aircraft(split_manifest, "train")[:4]
+                aircraft_ids = decision.aircraft_ids or _balanced_train_aircraft(index_df, split_manifest, min_n=4)
                 result = _test_rule_on_aircraft(index_df, aircraft_ids, cfg, rule)
             elif decision.action == "finalize_rule":
                 rule = decision.rule_bundle or default_rule
@@ -604,7 +685,9 @@ def reflect(
     )
     prompt = (
         "Decide whether to restart from observe, restart from hypothesize, or stop.\n"
-        "Use stop only when val metrics are good enough and stable.\n\n"
+        "Use stop only when validation metrics are good enough and stable.\n"
+        "If the condition was only tested on too few aircraft, or observe evidence was weak/leaky, prefer restart_from='observe'.\n"
+        "If the condition seems reasonable but metrics are weak, prefer restart_from='hypothesize'.\n\n"
         f"{MECHANISM_PROMPT}\n"
         f"rule={json.dumps(rule.model_dump(), ensure_ascii=False)}\n"
         f"validation={json.dumps(validation, ensure_ascii=False)}\n"

@@ -7,6 +7,15 @@ $ErrorActionPreference = "Stop"
 $RootDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $RootDir
 
+# Force UTF-8 for PowerShell <-> native process piping to avoid Chinese mojibake.
+chcp 65001 > $null
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding = $utf8NoBom
+[Console]::OutputEncoding = $utf8NoBom
+$OutputEncoding = $utf8NoBom
+[System.Environment]::SetEnvironmentVariable("PYTHONUTF8", "1", "Process")
+[System.Environment]::SetEnvironmentVariable("PYTHONIOENCODING", "utf-8", "Process")
+
 if (Test-Path ".env") {
     Get-Content ".env" | ForEach-Object {
         $line = $_.Trim()
