@@ -19,6 +19,54 @@ from .state import WorkflowState
 from .workers import choose_condition, propose_rule, reflect
 
 
+def _extract_observe_used_aircraft_ids(observe_trace: dict) -> list[str]:
+    used: set[str] = set()
+    trace = observe_trace.get("tool_trace", []) if isinstance(observe_trace, dict) else []
+    for item in trace:
+        if not isinstance(item, dict):
+            continue
+        d = item.get("decision", {}) if isinstance(item.get("decision", {}), dict) else {}
+        r = item.get("result", {}) if isinstance(item.get("result", {}), dict) else {}
+        aid = d.get("aircraft_id")
+        if aid:
+            used.add(str(aid))
+        for x in d.get("aircraft_ids", []) if isinstance(d.get("aircraft_ids", []), list) else []:
+            if x:
+                used.add(str(x))
+        ra = r.get("aircraft_id")
+        if ra:
+            used.add(str(ra))
+        for sf in r.get("sampled_flights", []) if isinstance(r.get("sampled_flights", []), list) else []:
+            if isinstance(sf, dict) and sf.get("aircraft_id"):
+                used.add(str(sf["aircraft_id"]))
+        for x in r.get("sampled_aircraft_ids", []) if isinstance(r.get("sampled_aircraft_ids", []), list) else []:
+            if x:
+                used.add(str(x))
+    return sorted(used)
+
+
+def _extract_condition_eval_summary(observe_trace: dict) -> dict:
+    trace = observe_trace.get("tool_trace", []) if isinstance(observe_trace, dict) else []
+    for item in reversed(trace):
+        if not isinstance(item, dict):
+            continue
+        d = item.get("decision", {}) if isinstance(item.get("decision", {}), dict) else {}
+        r = item.get("result", {}) if isinstance(item.get("result", {}), dict) else {}
+        if d.get("action") != "test_condition" or not isinstance(r, dict):
+            continue
+        return {
+            "n_windows": r.get("n_windows", 0),
+            "windows_per_label": r.get("windows_per_label", {}),
+            "n_aircraft_sampled": r.get("n_aircraft_sampled", 0),
+            "n_aircraft_with_windows": r.get("n_aircraft_with_windows", 0),
+            "faulty_side_window_coverage": r.get("faulty_side_window_coverage", {}),
+            "sampled_aircraft_ids": r.get("sampled_aircraft_ids", []),
+            "excluded_feature_prefixes": r.get("excluded_feature_prefixes", []),
+            "top_features": (r.get("top_features", []) or [])[:12],
+        }
+    return {}
+
+
 def _inner_validation_aircraft(split_manifest: dict) -> tuple[list[str], list[str]]:
     train = list(split_manifest["train_aircraft"])
     if len(train) <= 3:
@@ -120,6 +168,7 @@ def observe_node(state: WorkflowState) -> WorkflowState:
     index_df = pd.read_parquet(state["aircraft_index_path"])
     split_manifest = load_json(state["split_manifest_path"])
     knowledge_index = load_json(state["knowledge_index_path"])
+    observe_trace_live_path = round_dir / "observe_trace_live.json"
 
     condition_spec, observe_trace = choose_condition(
         cfg,
@@ -128,14 +177,17 @@ def observe_node(state: WorkflowState) -> WorkflowState:
         knowledge_index,
         str(workspace),
         int(state["current_round"]),
+        live_trace_path=str(observe_trace_live_path),
     )
     selected_condition_path = round_dir / "selected_condition.json"
     observe_trace_path = round_dir / "observe_trace.json"
     save_json(selected_condition_path, condition_spec.model_dump())
     save_json(observe_trace_path, observe_trace)
+    save_json(observe_trace_live_path, observe_trace)
     out = {
         "selected_condition_path": str(selected_condition_path),
         "observed_schema_path": str(observe_trace_path),
+        "observed_schema_live_path": str(observe_trace_live_path),
     }
     print(f"[observe] round={int(state['current_round'])} trace_steps={len(observe_trace.get('tool_trace', []))} done in {time.perf_counter()-t0:.1f}s")
     return out
@@ -151,6 +203,7 @@ def hypothesize_node(state: WorkflowState) -> WorkflowState:
     index_df = pd.read_parquet(state["aircraft_index_path"])
     split_manifest = load_json(state["split_manifest_path"])
     condition_spec = ConditionSpec.model_validate(load_json(state["selected_condition_path"]))
+    hypothesize_trace_live_path = round_dir / "hypothesize_trace_live.json"
 
     rule, trace = propose_rule(
         cfg,
@@ -161,12 +214,18 @@ def hypothesize_node(state: WorkflowState) -> WorkflowState:
         knowledge_index,
         str(workspace),
         int(state["current_round"]),
+        live_trace_path=str(hypothesize_trace_live_path),
     )
     candidate_rule_path = round_dir / "candidate_rule.json"
     hypothesize_trace_path = round_dir / "hypothesize_trace.json"
     save_json(candidate_rule_path, rule.model_dump())
     save_json(hypothesize_trace_path, trace)
-    out = {"candidate_rule_path": str(candidate_rule_path), "observation_summary_path": str(hypothesize_trace_path)}
+    save_json(hypothesize_trace_live_path, trace)
+    out = {
+        "candidate_rule_path": str(candidate_rule_path),
+        "observation_summary_path": str(hypothesize_trace_path),
+        "hypothesize_trace_live_path": str(hypothesize_trace_live_path),
+    }
     print(f"[hypothesize] round={int(state['current_round'])} trace_steps={len(trace.get('tool_trace', []))} done in {time.perf_counter()-t0:.1f}s")
     return out
 
@@ -179,38 +238,47 @@ def validate_node(state: WorkflowState) -> WorkflowState:
     index_df = pd.read_parquet(state["aircraft_index_path"])
     split_manifest = load_json(state["split_manifest_path"])
     rule = RuleBundle.model_validate(load_json(state["candidate_rule_path"]))
-    inner_train, inner_val = _inner_validation_aircraft(split_manifest)
+    observe_trace = {}
+    observed_schema_path = state.get("observed_schema_path", "")
+    if observed_schema_path and Path(observed_schema_path).exists():
+        observe_trace = load_json(observed_schema_path)
+    used_in_observe = _extract_observe_used_aircraft_ids(observe_trace)
+    train_all = list(split_manifest["train_aircraft"])
+    train_eval = [aid for aid in train_all if aid not in set(used_in_observe)]
+    if not train_eval:
+        train_eval = train_all
 
     print(
         f"[validate] round={int(state['current_round'])} "
-        f"max_flights_per_folder={cfg.loop.validation_max_flights_per_folder}"
+        f"max_flights_per_folder={cfg.loop.validation_max_flights_per_folder} "
+        f"train_eval_aircraft={len(train_eval)}/{len(train_all)}"
     )
     train_preds = classify_folder_units(
         index_df,
-        inner_train,
+        train_eval,
         rule,
         cfg,
         max_flights_per_folder=cfg.loop.validation_max_flights_per_folder,
         verbose=True,
-        tag="validate_train_inner",
+        tag="validate_train",
     )
     val_preds = classify_folder_units(
         index_df,
-        inner_val,
+        split_manifest["holdout_aircraft"],
         rule,
         cfg,
         max_flights_per_folder=cfg.loop.validation_max_flights_per_folder,
         verbose=True,
-        tag="validate_val_inner",
+        tag="validate_val",
     )
     report = {
         "training": summarize_folder_metrics(train_preds),
         "val": summarize_folder_metrics(val_preds),
         "n_training_units": len(train_preds),
         "n_val_units": len(val_preds),
-        "inner_train_aircraft": inner_train,
-        "inner_val_aircraft": inner_val,
-        "note": "validate 阶段只在训练飞机内部做 inner-train/inner-val 评估；holdout_aircraft 只留给 final_test。",
+        "observe_used_train_aircraft": used_in_observe,
+        "validate_train_aircraft": train_eval,
+        "n_observe_used_train_aircraft": len(used_in_observe),
     }
     validation_report_path = round_dir / "validation_report.json"
     save_json(validation_report_path, report)
@@ -228,6 +296,11 @@ def reflect_node(state: WorkflowState) -> WorkflowState:
     knowledge_index = load_json(state["knowledge_index_path"])
     rule = RuleBundle.model_validate(load_json(state["candidate_rule_path"]))
     validation = load_json(state["validation_report_path"])
+    observe_trace = {}
+    observed_schema_path = state.get("observed_schema_path", "")
+    if observed_schema_path and Path(observed_schema_path).exists():
+        observe_trace = load_json(observed_schema_path)
+    condition_eval_summary = _extract_condition_eval_summary(observe_trace)
     current_f1 = float(validation.get("val", {}).get("F1_1", 0.0))
     best_f1 = float(state.get("best_f1_class1", 0.0))
 
@@ -261,6 +334,7 @@ def reflect_node(state: WorkflowState) -> WorkflowState:
             "condition_spec": rule.condition_spec.model_dump(),
             "rule": rule.model_dump(),
             "validation": validation,
+            "condition_eval_summary": condition_eval_summary,
             "reflection": reflection.model_dump(),
         }
     ]

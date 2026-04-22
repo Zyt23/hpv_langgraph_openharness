@@ -130,6 +130,22 @@ def _last_trace_item(trace_items: list[dict], action: str) -> dict | None:
     return None
 
 
+def _flush_live_trace(live_trace_path: str | None, trace: list[dict], final_note: str | None = None) -> None:
+    if not live_trace_path:
+        return
+    payload: dict = {"tool_trace": trace}
+    if final_note is not None:
+        payload["final_note"] = final_note
+    payload["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        path = Path(live_trace_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        # Live trace is best-effort and must not break the workflow.
+        return
+
+
 def _progress_summary_for_observe(trace_items: list[dict]) -> dict:
     actions = _trace_action_list(trace_items)
     cnt = Counter(actions)
@@ -303,34 +319,49 @@ def _filter_top_features(rows: list[dict]) -> list[dict]:
     return out
 
 
+def _balanced_sample_rows(sub: pd.DataFrame, label: int, max_total: int) -> list[dict]:
+    df = sub[sub["folder_label"] == int(label)].copy()
+    if df.empty:
+        return []
+    n = max(1, int(max_total))
+    df = df.sort_values(["aircraft_id", "flight_path"]).copy()
+    # Round-robin by aircraft: ensures cross-aircraft coverage before taking additional flights.
+    df["_rr_rank"] = df.groupby("aircraft_id").cumcount()
+    rr = df.sort_values(["_rr_rank", "aircraft_id", "flight_path"]).head(n).drop(columns=["_rr_rank"])
+    return rr.to_dict(orient="records")
+
+
 def _test_condition_on_aircraft(index_df: pd.DataFrame, aircraft_ids: list[str], cfg: AppConfig, spec: ConditionSpec) -> dict:
-    # Cross-aircraft, balanced sampling: at most one flight per label per aircraft.
+    # Cross-aircraft, balanced sampling: use test_flights_per_label with aircraft round-robin.
     sub = index_df[index_df["aircraft_id"].isin(aircraft_ids)]
     windows = []
     sampled_flights = []
     windows_per_aircraft = {}
-    for aircraft_id in aircraft_ids:
-        sub_a = sub[sub["aircraft_id"] == aircraft_id]
-        for label in [0, 1]:
-            rows = sub_a[sub_a["folder_label"] == label].head(1).to_dict(orient="records")
-            for row in rows:
-                sampled_flights.append({
-                    "aircraft_id": row["aircraft_id"],
-                    "folder_label": int(row["folder_label"]),
-                    "flight_path": row["flight_path"],
-                })
-                ws = extract_windows_for_flight(
-                    row["flight_path"],
-                    int(row["folder_label"]),
-                    row["aircraft_id"],
-                    row["faulty_side"],
-                    cfg.features.min_rows_per_window,
-                    cfg.features.min_segment_len,
-                    spec,
-                )
-                windows.extend(ws)
-                windows_per_aircraft.setdefault(aircraft_id, {0: 0, 1: 0})
-                windows_per_aircraft[aircraft_id][int(row["folder_label"])] += len(ws)
+    faulty_side_window_coverage: dict[str, int] = {}
+    for label in [0, 1]:
+        rows = _balanced_sample_rows(sub, label, cfg.agent_tools.test_flights_per_label)
+        for row in rows:
+            aircraft_id = str(row["aircraft_id"])
+            sampled_flights.append({
+                "aircraft_id": aircraft_id,
+                "folder_label": int(row["folder_label"]),
+                "flight_path": row["flight_path"],
+            })
+            ws = extract_windows_for_flight(
+                row["flight_path"],
+                int(row["folder_label"]),
+                row["aircraft_id"],
+                row["faulty_side"],
+                cfg.features.min_rows_per_window,
+                cfg.features.min_segment_len,
+                spec,
+            )
+            windows.extend(ws)
+            windows_per_aircraft.setdefault(aircraft_id, {0: 0, 1: 0})
+            windows_per_aircraft[aircraft_id][int(row["folder_label"])] += len(ws)
+            side = str(row.get("faulty_side", ""))
+            if side:
+                faulty_side_window_coverage[side] = int(faulty_side_window_coverage.get(side, 0)) + len(ws)
     df = windows_to_frame(windows)
     top = summarize_window_features(df, top_k=20)
     label_counts = {}
@@ -339,13 +370,16 @@ def _test_condition_on_aircraft(index_df: pd.DataFrame, aircraft_ids: list[str],
         cnt = df["folder_label"].value_counts().to_dict()
         label_counts = {int(k): int(v) for k, v in cnt.items()}
         aircraft_with_windows = set(df["aircraft_id"].astype(str).tolist())
+    sampled_aircraft_ids = sorted({str(x.get("aircraft_id", "")) for x in sampled_flights if x.get("aircraft_id", "")})
     return {
         "condition_spec": spec.model_dump(),
         "n_windows": int(len(df)),
         "windows_per_label": label_counts,
-        "n_aircraft_sampled": int(len(aircraft_ids)),
+        "n_aircraft_sampled": int(len(sampled_aircraft_ids)),
         "n_aircraft_with_windows": int(len(aircraft_with_windows)),
         "windows_per_aircraft": windows_per_aircraft,
+        "faulty_side_window_coverage": faulty_side_window_coverage,
+        "sampled_aircraft_ids": sampled_aircraft_ids,
         "sampled_flights": sampled_flights,
         "top_features": _filter_top_features(top.get("top_features", [])),
         "excluded_feature_prefixes": list(LEAKY_PREFIXES + GATING_PREFIXES),
@@ -375,17 +409,23 @@ def choose_condition(
     knowledge_index: dict,
     workspace: str,
     round_no: int,
+    live_trace_path: str | None = None,
 ) -> tuple[ConditionSpec, dict]:
     kn = plan_knowledge(cfg, "observe_condition", {"round_no": round_no}, knowledge_index, workspace)
     trace: list[dict] = []
+
+    def append_trace(item: dict) -> None:
+        trace.append(item)
+        _flush_live_trace(live_trace_path, trace)
+
     try:
         probe_aircraft = _tool_list_aircraft(index_df, split_manifest, "train")
-        trace.append({"decision": {"action": "bootstrap_probe_list_aircraft", "split": "train"}, "result": probe_aircraft})
+        append_trace({"decision": {"action": "bootstrap_probe_list_aircraft", "split": "train"}, "result": probe_aircraft})
         ids = probe_aircraft.get("aircraft_ids", [])
         if ids:
             aid = ids[0]
             probe_flights = _tool_list_flights(index_df, split_manifest, "train", aid, 0, 1)
-            trace.append(
+            append_trace(
                 {
                     "decision": {"action": "bootstrap_probe_list_flights", "split": "train", "aircraft_id": aid, "folder_label": 0},
                     "result": probe_flights,
@@ -394,7 +434,7 @@ def choose_condition(
             fps = probe_flights.get("flight_paths", [])
             if fps:
                 probe_inspect = _tool_inspect_flight(index_df, split_manifest, "train", aid, 0, fps[0], cfg.agent_tools.inspect_max_rows)
-                trace.append(
+                append_trace(
                     {
                         "decision": {
                             "action": "bootstrap_probe_inspect_flight",
@@ -407,7 +447,7 @@ def choose_condition(
                     }
                 )
     except Exception as e:
-        trace.append({"decision": {"action": "bootstrap_probe"}, "result": {"error": str(e)}})
+        append_trace({"decision": {"action": "bootstrap_probe"}, "result": {"error": str(e)}})
     default_spec = ConditionSpec(
         name="baseline_operating_window",
         description="Fallback condition: stable non-ground operating window for later rule mining.",
@@ -464,7 +504,7 @@ def choose_condition(
                 flush=True,
             )
         except Exception as e:
-            trace.append({"decision": {"action": "model_call_observe"}, "result": {"error": str(e)}})
+            append_trace({"decision": {"action": "model_call_observe"}, "result": {"error": str(e)}})
             break
         if decision.action == "list_aircraft" and int(progress.get("consecutive_list_aircraft", 0)) >= 1:
             if progress.get("has_inspect_flight"):
@@ -517,20 +557,24 @@ def choose_condition(
                     enough_aircraft = int(r.get("n_aircraft_with_windows", 0)) >= 2
                     both_labels = set(map(int, (r.get("windows_per_label", {}) or {}).keys())) == {0, 1}
                     if not (enough_aircraft and both_labels):
-                        trace.append({
+                        append_trace({
                             "decision": decision.model_dump(),
                             "result": {"error": "finalize_condition_blocked_due_to_insufficient_cross_aircraft_or_label_coverage"},
                         })
                         print("[observe-worker] blocked finalize_condition due to weak evidence", flush=True)
                         continue
-                return spec, {"tool_trace": trace, "final_note": decision.note}
+                final = {"tool_trace": trace, "final_note": decision.note}
+                _flush_live_trace(live_trace_path, trace, decision.note)
+                return spec, final
             else:
                 result = {"error": f"Unsupported action {decision.action}"}
-            trace.append({"decision": decision.model_dump(), "result": result})
+            append_trace({"decision": decision.model_dump(), "result": result})
             print(f"[observe-worker] tool_done={decision.action}", flush=True)
         except Exception as e:
-            trace.append({"decision": decision.model_dump(), "result": {"error": str(e)}})
-    return default_spec, {"tool_trace": trace, "final_note": "fallback_default_condition"}
+            append_trace({"decision": decision.model_dump(), "result": {"error": str(e)}})
+    final = {"tool_trace": trace, "final_note": "fallback_default_condition"}
+    _flush_live_trace(live_trace_path, trace, "fallback_default_condition")
+    return default_spec, final
 
 
 def propose_rule(
@@ -542,6 +586,7 @@ def propose_rule(
     knowledge_index: dict,
     workspace: str,
     round_no: int,
+    live_trace_path: str | None = None,
 ) -> tuple[RuleBundle, dict]:
     kn = plan_knowledge(
         cfg,
@@ -551,6 +596,11 @@ def propose_rule(
         workspace,
     )
     trace: list[dict] = []
+
+    def append_trace(item: dict) -> None:
+        trace.append(item)
+        _flush_live_trace(live_trace_path, trace)
+
     default_rule = RuleBundle(
         condition_spec=condition_spec,
         rule_name="fallback_rule",
@@ -612,7 +662,7 @@ def propose_rule(
                 flush=True,
             )
         except Exception as e:
-            trace.append({"decision": {"action": "model_call_hypothesize"}, "result": {"error": str(e)}})
+            append_trace({"decision": {"action": "model_call_hypothesize"}, "result": {"error": str(e)}})
             break
         if decision.action == "list_aircraft" and int(progress.get("consecutive_list_aircraft", 0)) >= 1:
             if progress.get("has_test_rule"):
@@ -658,14 +708,18 @@ def propose_rule(
                 rule.condition_spec = condition_spec
                 if not rule.folder_vote_threshold:
                     rule.folder_vote_threshold = cfg.loop.folder_vote_threshold
-                return rule, {"tool_trace": trace, "final_note": decision.note}
+                final = {"tool_trace": trace, "final_note": decision.note}
+                _flush_live_trace(live_trace_path, trace, decision.note)
+                return rule, final
             else:
                 result = {"error": f"Unsupported action {decision.action}"}
-            trace.append({"decision": decision.model_dump(), "result": result})
+            append_trace({"decision": decision.model_dump(), "result": result})
             print(f"[hypothesize-worker] tool_done={decision.action}", flush=True)
         except Exception as e:
-            trace.append({"decision": decision.model_dump(), "result": {"error": str(e)}})
-    return default_rule, {"tool_trace": trace, "final_note": "fallback_default_rule"}
+            append_trace({"decision": decision.model_dump(), "result": {"error": str(e)}})
+    final = {"tool_trace": trace, "final_note": "fallback_default_rule"}
+    _flush_live_trace(live_trace_path, trace, "fallback_default_rule")
+    return default_rule, final
 
 
 def reflect(
