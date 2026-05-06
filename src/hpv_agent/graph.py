@@ -16,7 +16,7 @@ from .metrics import classify_folder_units, format_metrics_table, summarize_fold
 from .preflight import check_openharness_connectivity
 from .schema import ConditionSpec, RuleBundle
 from .state import WorkflowState
-from .workers import choose_condition, propose_rule, reflect
+from .workers import choose_condition, default_operating_condition, propose_rule, reflect
 
 
 def _extract_observe_used_aircraft_ids(observe_trace: dict) -> list[str]:
@@ -52,7 +52,7 @@ def _extract_condition_eval_summary(observe_trace: dict) -> dict:
             continue
         d = item.get("decision", {}) if isinstance(item.get("decision", {}), dict) else {}
         r = item.get("result", {}) if isinstance(item.get("result", {}), dict) else {}
-        if d.get("action") != "test_condition" or not isinstance(r, dict):
+        if d.get("action") not in {"test_condition", "profile_condition_windows"} or not isinstance(r, dict):
             continue
         return {
             "n_windows": r.get("n_windows", 0),
@@ -100,7 +100,13 @@ def bootstrap_node(state: WorkflowState) -> WorkflowState:
         )
     shared_cache_dir = ensure_dir(cfg.paths.artifacts_root / "_shared_cache")
     data_key = hashlib.md5(str(cfg.paths.data_root.resolve()).encode("utf-8")).hexdigest()[:12]
-    split_key = hashlib.md5(f"{data_key}|{cfg.split.seed}|{cfg.split.train_aircraft_count}".encode("utf-8")).hexdigest()[:12]
+    split_key = hashlib.md5(
+        (
+            "split_v2|"
+            f"{data_key}|{cfg.split.seed}|{cfg.split.train_aircraft_count}|"
+            f"{cfg.split.validation_aircraft_count}|{cfg.split.holdout_aircraft_count}"
+        ).encode("utf-8")
+    ).hexdigest()[:12]
     know_key = hashlib.md5(("|".join(sorted(cfg.paths.knowledge_globs))).encode("utf-8")).hexdigest()[:12]
 
     aircraft_index_path = shared_cache_dir / f"aircraft_index_{data_key}.parquet"
@@ -122,6 +128,14 @@ def bootstrap_node(state: WorkflowState) -> WorkflowState:
         print(f"[bootstrap] split_manifest cache created: {split_manifest_path}", flush=True)
     else:
         print(f"[bootstrap] reuse split_manifest cache: {split_manifest_path}", flush=True)
+    split_manifest = load_json(split_manifest_path)
+    print(
+        "[bootstrap] split sizes "
+        f"train={len(split_manifest.get('train_aircraft', []))} "
+        f"validation={len(split_manifest.get('validation_aircraft', []))} "
+        f"holdout={len(split_manifest.get('holdout_aircraft', []))}",
+        flush=True,
+    )
     if not knowledge_index_path.exists():
         print("[bootstrap] building knowledge_index cache ...", flush=True)
         save_json(knowledge_index_path, build_knowledge_index(cfg))
@@ -202,7 +216,13 @@ def hypothesize_node(state: WorkflowState) -> WorkflowState:
     knowledge_index = load_json(state["knowledge_index_path"])
     index_df = pd.read_parquet(state["aircraft_index_path"])
     split_manifest = load_json(state["split_manifest_path"])
-    condition_spec = ConditionSpec.model_validate(load_json(state["selected_condition_path"]))
+    selected_condition_path = state.get("selected_condition_path", "")
+    if selected_condition_path and Path(selected_condition_path).exists():
+        condition_spec = ConditionSpec.model_validate(load_json(selected_condition_path))
+    else:
+        condition_spec = default_operating_condition(cfg)
+        selected_condition_path = str(round_dir / "selected_condition.json")
+        save_json(selected_condition_path, condition_spec.model_dump())
     hypothesize_trace_live_path = round_dir / "hypothesize_trace_live.json"
 
     rule, trace = propose_rule(
@@ -225,6 +245,7 @@ def hypothesize_node(state: WorkflowState) -> WorkflowState:
         "candidate_rule_path": str(candidate_rule_path),
         "observation_summary_path": str(hypothesize_trace_path),
         "hypothesize_trace_live_path": str(hypothesize_trace_live_path),
+        "selected_condition_path": selected_condition_path,
     }
     print(f"[hypothesize] round={int(state['current_round'])} trace_steps={len(trace.get('tool_trace', []))} done in {time.perf_counter()-t0:.1f}s")
     return out
@@ -252,6 +273,8 @@ def validate_node(state: WorkflowState) -> WorkflowState:
         f"[validate] round={int(state['current_round'])} "
         f"max_flights_per_folder={cfg.loop.validation_max_flights_per_folder} "
         f"train_eval_aircraft={len(train_eval)}/{len(train_all)}"
+        ,
+        flush=True,
     )
     train_preds = classify_folder_units(
         index_df,
@@ -262,28 +285,41 @@ def validate_node(state: WorkflowState) -> WorkflowState:
         verbose=True,
         tag="validate_train",
     )
+    validation_aircraft = list(split_manifest.get("validation_aircraft", []))
+    if not validation_aircraft:
+        raise RuntimeError("split_manifest is missing validation_aircraft; rebuild the split cache")
     val_preds = classify_folder_units(
         index_df,
-        split_manifest["holdout_aircraft"],
+        validation_aircraft,
         rule,
         cfg,
         max_flights_per_folder=cfg.loop.validation_max_flights_per_folder,
         verbose=True,
-        tag="validate_val",
+        tag="validate_validation",
     )
+    validation_metrics = summarize_folder_metrics(val_preds)
     report = {
         "training": summarize_folder_metrics(train_preds),
-        "val": summarize_folder_metrics(val_preds),
+        "validation": validation_metrics,
+        "val": validation_metrics,
         "n_training_units": len(train_preds),
-        "n_val_units": len(val_preds),
+        "n_validation_units": len(val_preds),
         "observe_used_train_aircraft": used_in_observe,
         "validate_train_aircraft": train_eval,
+        "validation_aircraft": validation_aircraft,
         "n_observe_used_train_aircraft": len(used_in_observe),
+        "holdout_policy": "holdout_aircraft are reserved for final_test only",
     }
     validation_report_path = round_dir / "validation_report.json"
     save_json(validation_report_path, report)
     print(f"[validate] round={int(state['current_round'])} done in {time.perf_counter()-t0:.1f}s")
-    return {"validation_report_path": str(validation_report_path)}
+    return {
+        "validation_report_path": str(validation_report_path),
+        "best_rule": rule.model_dump(),
+        "best_f1_class1": float(validation_metrics.get("F1_1", 0.0)),
+        "stop": True,
+        "stop_reason": "direct_tool_mode_single_pass",
+    }
 
 
 def reflect_node(state: WorkflowState) -> WorkflowState:
@@ -301,7 +337,7 @@ def reflect_node(state: WorkflowState) -> WorkflowState:
     if observed_schema_path and Path(observed_schema_path).exists():
         observe_trace = load_json(observed_schema_path)
     condition_eval_summary = _extract_condition_eval_summary(observe_trace)
-    current_f1 = float(validation.get("val", {}).get("F1_1", 0.0))
+    current_f1 = float(validation.get("validation", validation.get("val", {})).get("F1_1", 0.0))
     best_f1 = float(state.get("best_f1_class1", 0.0))
 
     reflection = reflect(cfg, rule, validation, state.get("history", []), knowledge_index, str(workspace))
@@ -375,11 +411,15 @@ def final_test_node(state: WorkflowState) -> WorkflowState:
     split_manifest = load_json(state["split_manifest_path"])
     index_df = pd.read_parquet(state["aircraft_index_path"])
     best_rule_raw = state.get("best_rule")
+    if not best_rule_raw and state.get("candidate_rule_path") and Path(state["candidate_rule_path"]).exists():
+        best_rule_raw = load_json(state["candidate_rule_path"])
     if not best_rule_raw:
         return {}
     rule = RuleBundle.model_validate(best_rule_raw)
     print(
         f"[final_test] max_flights_per_folder={cfg.loop.final_eval_max_flights_per_folder}"
+        ,
+        flush=True,
     )
     training_preds = classify_folder_units(
         index_df,
@@ -392,7 +432,7 @@ def final_test_node(state: WorkflowState) -> WorkflowState:
     )
     holdout_preds = classify_folder_units(
         index_df,
-        split_manifest["holdout_aircraft"],
+        split_manifest.get("holdout_aircraft", []),
         rule,
         cfg,
         max_flights_per_folder=cfg.loop.final_eval_max_flights_per_folder,
@@ -420,20 +460,12 @@ def route_after_reflect(state: WorkflowState) -> Literal["observe", "hypothesize
 def build_graph():
     graph = StateGraph(WorkflowState)
     graph.add_node("bootstrap", bootstrap_node)
-    graph.add_node("observe", observe_node)
     graph.add_node("hypothesize", hypothesize_node)
     graph.add_node("validate", validate_node)
-    graph.add_node("reflect", reflect_node)
     graph.add_node("final_test", final_test_node)
     graph.add_edge(START, "bootstrap")
-    graph.add_edge("bootstrap", "observe")
-    graph.add_edge("observe", "hypothesize")
+    graph.add_edge("bootstrap", "hypothesize")
     graph.add_edge("hypothesize", "validate")
-    graph.add_edge("validate", "reflect")
-    graph.add_conditional_edges(
-        "reflect",
-        route_after_reflect,
-        {"observe": "observe", "hypothesize": "hypothesize", "final_test": "final_test"},
-    )
+    graph.add_edge("validate", "final_test")
     graph.add_edge("final_test", END)
     return graph.compile()

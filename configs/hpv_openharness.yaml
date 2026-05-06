@@ -18,6 +18,8 @@ openharness:
 split:
   seed: 42
   train_aircraft_count: 10
+  validation_aircraft_count: 3
+  holdout_aircraft_count: 0
 
 agent_tools:
   observe_max_steps: 8
@@ -33,9 +35,9 @@ loop:
   target_f1_class1: 0.80
   patience_rounds: 3
   min_improvement: 0.02
-  tool_eval_max_flights_per_folder: 20
-  validation_max_flights_per_folder: 20
-  final_eval_max_flights_per_folder: 0
+  tool_eval_max_flights_per_folder: 5
+  validation_max_flights_per_folder: 5
+  final_eval_max_flights_per_folder: 5
 
 features:
   min_segment_len: 60

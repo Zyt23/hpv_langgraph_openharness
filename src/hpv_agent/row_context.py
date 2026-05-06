@@ -71,6 +71,8 @@ def build_row_context(df: pd.DataFrame, faulty_side: str) -> pd.DataFrame:
             out[alias] = np.nan
     out["pressure_diff"] = out["affected_pressure"] - out["healthy_pressure"]
     out["pressure_abs_diff"] = out["pressure_diff"].abs()
+    out["n2_diff"] = out["affected_n2"] - out["healthy_n2"]
+    out["n2_abs_diff"] = out["n2_diff"].abs()
     out["precool_diff"] = out["affected_precool"] - out["healthy_precool"]
     out["precool_abs_diff"] = out["precool_diff"].abs()
     out["hpv_diff"] = out["affected_hpv"] - out["healthy_hpv"]
@@ -141,6 +143,8 @@ def window_features(seg_ctx: pd.DataFrame) -> Dict[str, float]:
         "healthy_n2",
         "affected_pressure",
         "healthy_pressure",
+        "n2_diff",
+        "n2_abs_diff",
         "affected_precool",
         "healthy_precool",
         "pressure_diff",

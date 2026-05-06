@@ -42,7 +42,7 @@ class ReflectionDecision(BaseModel):
 
 
 class ObserveAction(BaseModel):
-    action: Literal["list_aircraft", "list_flights", "inspect_flight", "test_condition", "finalize_condition"] = "finalize_condition"
+    action: Literal["list_aircraft", "list_flights", "inspect_flight", "test_condition", "profile_condition_windows", "finalize_condition"] = "finalize_condition"
     split: Literal["train"] = "train"
     aircraft_id: str = ""
     folder_label: int = 0
@@ -54,7 +54,20 @@ class ObserveAction(BaseModel):
 
 
 class HypothesizeAction(BaseModel):
-    action: Literal["list_aircraft", "list_flights", "inspect_flight", "test_rule", "finalize_rule"] = "finalize_rule"
+    action: Literal[
+        "list_aircraft",
+        "list_flights",
+        "inspect_flight",
+        "profile_condition_windows",
+        "mine_candidate_rules",
+        "robust_normal_baseline",
+        "isolation_forest_windows",
+        "lag_correlation_flight",
+        "change_point_flight",
+        "matrix_profile_discords",
+        "test_rule",
+        "finalize_rule",
+    ] = "finalize_rule"
     split: Literal["train"] = "train"
     aircraft_id: str = ""
     folder_label: int = 0
@@ -62,6 +75,13 @@ class HypothesizeAction(BaseModel):
     flight_path: str = ""
     aircraft_ids: List[str] = Field(default_factory=list)
     rule_bundle: RuleBundle | None = None
+    contamination: float = 0.20
+    max_lag: int = 300
+    columns: List[str] = Field(default_factory=list)
+    penalty: float = 8.0
+    column: str = "pressure_diff"
+    subseq_len: int = 120
+    top_k: int = 5
     note: str = ""
 
 

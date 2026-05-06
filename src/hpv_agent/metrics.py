@@ -60,7 +60,7 @@ def classify_folder_units(
     for i, aircraft_id in enumerate(aircraft_ids, start=1):
         if verbose:
             prefix = f"[{tag}] " if tag else ""
-            print(f"{prefix}classify aircraft {i}/{total_aircraft}: {aircraft_id}")
+            print(f"{prefix}classify aircraft {i}/{total_aircraft}: {aircraft_id}", flush=True)
         sub_aircraft = index_df[index_df["aircraft_id"] == aircraft_id]
         faulty_side = sub_aircraft["faulty_side"].iloc[0]
         for true_label in [0, 1]:

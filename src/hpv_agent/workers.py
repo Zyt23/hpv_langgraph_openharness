@@ -14,6 +14,15 @@ from .observation import summarize_window_features
 from .openharness_adapter import run_openharness_structured
 from .row_context import build_row_context, extract_windows_for_flight, load_flight, windows_to_frame
 from .schema import ConditionSpec, HypothesizeAction, KnowledgeRequest, ObserveAction, ReflectionDecision, RuleBundle
+from .ts_tools import (
+    change_point_flight_tool,
+    isolation_forest_window_tool,
+    lag_correlation_flight_tool,
+    matrix_profile_discords_tool,
+    mine_candidate_rules_tool,
+    profile_condition_windows_tool,
+    robust_normal_baseline_tool,
+)
 
 
 MECHANISM_PROMPT = """
@@ -94,9 +103,30 @@ def _compact_trace_for_prompt(trace_items: list[dict]) -> list[dict]:
                 "n_aircraft_with_windows",
                 "metrics",
                 "error",
+                "split_used",
+                "guard",
+                "rf_group_cv_window_metrics",
+                "score_summary",
+                "threshold",
+                "best_training_score_threshold",
+                "sampled_train_folder_metrics",
             ]:
                 if k in r:
                     rr[k] = r.get(k)
+            for k, n in [
+                ("feature_comparisons", 8),
+                ("candidate_rules", 5),
+                ("threshold_candidates", 8),
+                ("selected_features", 8),
+                ("rf_feature_importances", 10),
+                ("top_anomalous_windows", 8),
+                ("top_lagged_correlations", 10),
+                ("change_points", 10),
+                ("discords", 10),
+            ]:
+                if k in r:
+                    v = r.get(k)
+                    rr[k] = v[:n] if isinstance(v, list) else v
             row["result_summary"] = rr
         compact.append(row)
     return compact
@@ -130,6 +160,13 @@ def _last_trace_item(trace_items: list[dict], action: str) -> dict | None:
     return None
 
 
+def _last_trace_item_any(trace_items: list[dict], actions: set[str]) -> dict | None:
+    for item in reversed(trace_items):
+        if item.get("decision", {}).get("action") in actions:
+            return item
+    return None
+
+
 def _flush_live_trace(live_trace_path: str | None, trace: list[dict], final_note: str | None = None) -> None:
     if not live_trace_path:
         return
@@ -149,7 +186,7 @@ def _flush_live_trace(live_trace_path: str | None, trace: list[dict], final_note
 def _progress_summary_for_observe(trace_items: list[dict]) -> dict:
     actions = _trace_action_list(trace_items)
     cnt = Counter(actions)
-    last_test = _last_trace_item(trace_items, "test_condition")
+    last_test = _last_trace_item_any(trace_items, {"test_condition", "profile_condition_windows"})
     last_windows = None
     last_windows_per_label = {}
     last_test_spec = None
@@ -196,9 +233,17 @@ def _progress_summary_for_hypothesize(trace_items: list[dict]) -> dict:
 def _split_aircraft(split_manifest: dict, split: str) -> list[str]:
     if split == "train":
         return split_manifest["train_aircraft"]
-    if split == "val":
+    if split in {"val", "validation"}:
+        return split_manifest.get("validation_aircraft", [])
+    if split == "holdout":
         return split_manifest.get("holdout_aircraft", [])
-    return sorted(set(split_manifest["train_aircraft"] + split_manifest.get("holdout_aircraft", [])))
+    return sorted(
+        set(
+            split_manifest["train_aircraft"]
+            + split_manifest.get("validation_aircraft", [])
+            + split_manifest.get("holdout_aircraft", [])
+        )
+    )
 
 
 def _balanced_train_aircraft(index_df: pd.DataFrame, split_manifest: dict, min_n: int = 4) -> list[str]:
@@ -279,6 +324,8 @@ def _tool_inspect_flight(
         "healthy_n2",
         "affected_pressure",
         "healthy_pressure",
+        "n2_diff",
+        "n2_abs_diff",
         "affected_hpv",
         "healthy_hpv",
         "pressure_abs_diff",
@@ -402,6 +449,77 @@ def _test_rule_on_aircraft(index_df: pd.DataFrame, aircraft_ids: list[str], cfg:
     }
 
 
+def default_operating_condition(cfg: AppConfig) -> ConditionSpec:
+    return ConditionSpec(
+        name="broad_both_engines_running",
+        description="Fixed broad operating window for direct tool-based diagnosis; observe stage is skipped.",
+        expression="(phase >= 2) & (phase <= 8) & (altitude > 1000) & (affected_n2 > 50) & (healthy_n2 > 50)",
+        min_segment_len=cfg.features.min_segment_len,
+    )
+
+
+def _train_only_aircraft_ids(split_manifest: dict, aircraft_ids: list[str]) -> list[str]:
+    train_allowed = set(_split_aircraft(split_manifest, "train"))
+    return [str(aid) for aid in aircraft_ids if str(aid) in train_allowed]
+
+
+def _best_candidate_rule_from_trace(trace_items: list[dict], condition_spec: ConditionSpec) -> RuleBundle | None:
+    best_payload = None
+    best_key = (-1.0, -1.0, -1.0, -1.0)
+    for item in trace_items:
+        result = item.get("result", {}) if isinstance(item.get("result", {}), dict) else {}
+        candidates = result.get("candidate_rules", [])
+        if not isinstance(candidates, list):
+            continue
+        for candidate in candidates:
+            if not isinstance(candidate, dict) or not isinstance(candidate.get("rule_bundle"), dict):
+                continue
+            window_metrics = candidate.get("training_window_metrics", {}) if isinstance(candidate.get("training_window_metrics", {}), dict) else {}
+            folder_metrics = candidate.get("sampled_train_folder_metrics", {}) if isinstance(candidate.get("sampled_train_folder_metrics", {}), dict) else {}
+            f1_0 = float(folder_metrics.get("F1_0", 0.0) or 0.0)
+            f1_1 = float(folder_metrics.get("F1_1", 0.0) or 0.0)
+            key = (
+                min(f1_0, f1_1),
+                (f1_0 + f1_1) / 2.0,
+                f1_1,
+                float(window_metrics.get("f1", 0.0) or 0.0),
+            )
+            if key > best_key:
+                best_key = key
+                best_payload = candidate["rule_bundle"]
+    if best_payload is None:
+        return None
+    rule = RuleBundle.model_validate(best_payload)
+    rule.condition_spec = condition_spec
+    return rule
+
+
+def _pick_training_flight(
+    index_df: pd.DataFrame,
+    split_manifest: dict,
+    aircraft_id: str = "",
+    folder_label: int = 0,
+    flight_path: str = "",
+) -> tuple[str, str, str, int]:
+    allowed = set(_split_aircraft(split_manifest, "train"))
+    sub = index_df[index_df["aircraft_id"].isin(allowed)].copy()
+    if flight_path:
+        hit = sub[sub["flight_path"] == flight_path]
+        if hit.empty:
+            hit = sub[sub["flight_path"].str.endswith(Path(flight_path).name)]
+        if not hit.empty:
+            row = hit.iloc[0]
+            return str(row["flight_path"]), str(row["faulty_side"]), str(row["aircraft_id"]), int(row["folder_label"])
+    if aircraft_id:
+        sub = sub[sub["aircraft_id"] == aircraft_id]
+    if int(folder_label) in (0, 1):
+        sub = sub[sub["folder_label"] == int(folder_label)]
+    if sub.empty:
+        raise ValueError("No train flight found for time-series flight tool")
+    row = sub.sort_values(["aircraft_id", "folder_label", "flight_path"]).iloc[0]
+    return str(row["flight_path"]), str(row["faulty_side"]), str(row["aircraft_id"]), int(row["folder_label"])
+
+
 def choose_condition(
     cfg: AppConfig,
     index_df: pd.DataFrame,
@@ -448,12 +566,7 @@ def choose_condition(
                 )
     except Exception as e:
         append_trace({"decision": {"action": "bootstrap_probe"}, "result": {"error": str(e)}})
-    default_spec = ConditionSpec(
-        name="baseline_operating_window",
-        description="Fallback condition: stable non-ground operating window for later rule mining.",
-        expression="(phase >= 2) & (phase <= 8) & (altitude > 1000) & (affected_n2 > 50) & (healthy_n2 > 50)",
-        min_segment_len=cfg.features.min_segment_len,
-    )
+    default_spec = default_operating_condition(cfg)
     for _ in range(cfg.agent_tools.observe_max_steps):
         compact_trace = _compact_trace_for_prompt(trace[-6:])
         progress = _progress_summary_for_observe(trace)
@@ -470,13 +583,14 @@ def choose_condition(
             "You are in OBSERVE stage. Decide one tool action now.\n"
             "Return ObserveAction JSON only.\n\n"
             f"{MECHANISM_PROMPT}\n"
-            "Allowed actions: list_aircraft, list_flights, inspect_flight, test_condition, finalize_condition.\n"
+            "Allowed actions: list_aircraft, list_flights, inspect_flight, test_condition, profile_condition_windows, finalize_condition.\n"
             "All tool calls must stay on training split only.\n"
             "observe stage goal: propose an informative operating condition, not a classifier rule.\n"
             "Tool policy:\n"
             "- list_aircraft is only for initial orientation; do not keep repeating it.\n"
             "- inspect_flight should inspect a small number of representative flights from different aircraft / sides.\n"
             "- test_condition must use multiple aircraft_ids, preferably >= 3 and covering both fault sides when possible.\n"
+            "- profile_condition_windows is the preferred evidence tool after proposing a condition; it returns train-only normal-vs-abnormal statistics.\n"
             "- Do NOT finalize a condition after testing only one aircraft.\n"
             "- top_features may include leakage if you misuse time_group/tail_num/lat/lon; avoid that.\n"
             "Condition expression must be a Python-style expression over row-context aliases, such as:\n"
@@ -545,13 +659,25 @@ def choose_condition(
             elif decision.action == "test_condition":
                 spec = decision.condition_spec or default_spec
                 aircraft_ids = decision.aircraft_ids or _balanced_train_aircraft(index_df, split_manifest, min_n=4)
+                aircraft_ids = _train_only_aircraft_ids(split_manifest, aircraft_ids)
                 if len(aircraft_ids) < 3:
                     extra = _balanced_train_aircraft(index_df, split_manifest, min_n=4)
                     aircraft_ids = list(dict.fromkeys(list(aircraft_ids) + extra))[:4]
                 result = _test_condition_on_aircraft(index_df, aircraft_ids, cfg, spec)
+            elif decision.action == "profile_condition_windows":
+                spec = decision.condition_spec or default_spec
+                aircraft_ids = decision.aircraft_ids or _balanced_train_aircraft(index_df, split_manifest, min_n=4)
+                result = profile_condition_windows_tool(
+                    index_df,
+                    split_manifest,
+                    cfg,
+                    spec,
+                    aircraft_ids=aircraft_ids,
+                    max_flights_per_label_per_aircraft=3,
+                )
             elif decision.action == "finalize_condition":
                 spec = decision.condition_spec or default_spec
-                last_test = _last_trace_item(trace, "test_condition")
+                last_test = _last_trace_item_any(trace, {"test_condition", "profile_condition_windows"})
                 if last_test:
                     r = last_test.get("result", {})
                     enough_aircraft = int(r.get("n_aircraft_with_windows", 0)) >= 2
@@ -588,13 +714,7 @@ def propose_rule(
     round_no: int,
     live_trace_path: str | None = None,
 ) -> tuple[RuleBundle, dict]:
-    kn = plan_knowledge(
-        cfg,
-        "propose_rule",
-        {"round_no": round_no, "condition_spec": condition_spec.model_dump(), "history": history[-3:]},
-        knowledge_index,
-        workspace,
-    )
+    kn: list[dict] = []
     trace: list[dict] = []
 
     def append_trace(item: dict) -> None:
@@ -609,6 +729,91 @@ def propose_rule(
         folder_vote_threshold=cfg.loop.folder_vote_threshold,
         rationale="Fallback rule from pressure asymmetry, precool asymmetry, and HPV opening behavior.",
     )
+    seed_aircraft = _balanced_train_aircraft(index_df, split_manifest, min_n=8)
+    for action, fn in [
+        ("profile_condition_windows", profile_condition_windows_tool),
+        ("mine_candidate_rules", mine_candidate_rules_tool),
+        ("robust_normal_baseline", robust_normal_baseline_tool),
+    ]:
+        try:
+            result = fn(
+                index_df,
+                split_manifest,
+                cfg,
+                condition_spec,
+                aircraft_ids=seed_aircraft,
+                max_flights_per_label_per_aircraft=2,
+            )
+        except Exception as e:
+            result = {"error": str(e), "split_used": "train"}
+        append_trace(
+            {
+                "decision": {
+                    "action": action,
+                    "aircraft_ids": seed_aircraft,
+                    "note": "auto_train_only_evidence_before_agent_reasoning",
+                },
+                "result": result,
+            }
+        )
+
+    compact_trace = _compact_trace_for_prompt(trace)
+    mined_rule = _best_candidate_rule_from_trace(trace, condition_spec)
+    prompt = (
+        "You are in DIRECT TOOL-BASED DIAGNOSIS mode.\n"
+        "The observe stage has been skipped. The program already ran train-only time-series tools.\n"
+        "Choose one final RuleBundle now, using the tool evidence below. Do not request more tool calls.\n"
+        "Return HypothesizeAction JSON with action='finalize_rule' and a concrete rule_bundle.\n\n"
+        f"{MECHANISM_PROMPT}\n"
+        "Constraints:\n"
+        "- rule_bundle.condition_spec must equal fixed_condition_spec.\n"
+        "- Prefer candidate_rules from mine_candidate_rules when their train-window metrics are stronger.\n"
+        "- Prefer sampled_train_folder_metrics over window metrics; the final task is folder-level classification.\n"
+        "- Avoid rules that get one class near zero F1; prefer balanced F1_0/F1_1 before raw window F1.\n"
+        "- Prefer side-asymmetry features such as n2_diff/n2_abs_diff, pressure_diff/pressure_abs_diff, precool_diff, hpv_diff.\n"
+        "- Do not use raw affected_n2__* or healthy_n2__* as final discriminators unless no asymmetry rule exists.\n"
+        "- Avoid time_group/tail_num/lat/lon and avoid phase/altitude in score_expression.\n"
+        "- Keep the final rule simple enough for programmatic validation.\n"
+        "- This prompt contains train-only evidence; validation and holdout are not shown.\n\n"
+        f"fixed_condition_spec={json.dumps(condition_spec.model_dump(), ensure_ascii=False)}\n"
+        f"history={json.dumps(history[-3:], ensure_ascii=False)}\n"
+        f"tool_evidence={json.dumps(compact_trace, ensure_ascii=False)}\n"
+        f"best_mined_rule={json.dumps(mined_rule.model_dump() if mined_rule else None, ensure_ascii=False)}\n"
+    )
+    try:
+        t_call = time.perf_counter()
+        print(f"[hypothesize-worker] direct_model_call prompt_chars={len(prompt)}", flush=True)
+        decision = run_openharness_structured(prompt, HypothesizeAction, cfg, workspace)
+        rule = decision.rule_bundle or mined_rule or default_rule
+        rule.condition_spec = condition_spec
+        if not rule.folder_vote_threshold:
+            rule.folder_vote_threshold = cfg.loop.folder_vote_threshold
+        append_trace(
+            {
+                "decision": decision.model_dump(),
+                "result": {
+                    "direct_mode": True,
+                    "selected_rule": rule.model_dump(),
+                    "model_elapsed_sec": round(time.perf_counter() - t_call, 1),
+                },
+            }
+        )
+        final = {"tool_trace": trace, "final_note": decision.note or "direct_tool_rule_selection"}
+        _flush_live_trace(live_trace_path, trace, final["final_note"])
+        return rule, final
+    except Exception as e:
+        rule = mined_rule or default_rule
+        rule.condition_spec = condition_spec
+        append_trace(
+            {
+                "decision": {"action": "finalize_rule", "note": "fallback_after_direct_model_error"},
+                "result": {"direct_mode": True, "error": str(e), "selected_rule": rule.model_dump()},
+            }
+        )
+        final = {"tool_trace": trace, "final_note": "fallback_after_direct_model_error"}
+        _flush_live_trace(live_trace_path, trace, final["final_note"])
+        return rule, final
+
     for _ in range(cfg.agent_tools.hypothesize_max_steps):
         compact_trace = _compact_trace_for_prompt(trace[-6:])
         progress = _progress_summary_for_hypothesize(trace)
@@ -624,11 +829,15 @@ def propose_rule(
             "You are in HYPOTHESIZE stage. Decide one tool action now.\n"
             "Return HypothesizeAction JSON only.\n\n"
             f"{MECHANISM_PROMPT}\n"
-            "Allowed actions: list_aircraft, list_flights, inspect_flight, test_rule, finalize_rule.\n"
+            "Allowed actions: list_aircraft, list_flights, inspect_flight, "
+            "profile_condition_windows, mine_candidate_rules, robust_normal_baseline, isolation_forest_windows, "
+            "lag_correlation_flight, change_point_flight, matrix_profile_discords, test_rule, finalize_rule.\n"
             "All tool calls must stay on training split only.\n"
             "Action policy:\n"
             "- Do not repeat list_aircraft if you already listed aircraft once.\n"
             "- The operating condition is fixed; do not rewrite it here.\n"
+            "- Prefer the train-only candidate_rules returned by mine_candidate_rules or robust_normal_baseline.\n"
+            "- Use flight-level lag/change/discord tools only on flight_path values returned by train list_flights/inspect_flight.\n"
             "- Avoid using time_group/tail_num/lat/lon in score_expression.\n"
             "- Prefer pressure/precool/hpv-related window features.\n"
             "- After inspect_flight and test_rule, prefer finalize_rule with a concrete rule_bundle.\n"
@@ -667,13 +876,13 @@ def propose_rule(
         if decision.action == "list_aircraft" and int(progress.get("consecutive_list_aircraft", 0)) >= 1:
             if progress.get("has_test_rule"):
                 decision.action = "finalize_rule"
-                decision.rule_bundle = decision.rule_bundle or default_rule
+                decision.rule_bundle = decision.rule_bundle or _best_candidate_rule_from_trace(trace, condition_spec) or default_rule
                 decision.note = "auto_finalize_after_repeated_list_aircraft"
                 print("[hypothesize-worker] auto_override list_aircraft -> finalize_rule", flush=True)
             else:
                 decision.action = "test_rule"
                 decision.aircraft_ids = decision.aircraft_ids or _balanced_train_aircraft(index_df, split_manifest, min_n=4)
-                decision.rule_bundle = decision.rule_bundle or default_rule
+                decision.rule_bundle = decision.rule_bundle or _best_candidate_rule_from_trace(trace, condition_spec) or default_rule
                 decision.note = "auto_test_rule_after_repeated_list_aircraft"
                 print("[hypothesize-worker] auto_override list_aircraft -> test_rule", flush=True)
         try:
@@ -698,13 +907,94 @@ def propose_rule(
                     decision.flight_path,
                     cfg.agent_tools.inspect_max_rows,
                 )
+            elif decision.action == "profile_condition_windows":
+                result = profile_condition_windows_tool(
+                    index_df,
+                    split_manifest,
+                    cfg,
+                    condition_spec,
+                    aircraft_ids=decision.aircraft_ids or _balanced_train_aircraft(index_df, split_manifest, min_n=4),
+                    max_flights_per_label_per_aircraft=3,
+                )
+            elif decision.action == "mine_candidate_rules":
+                result = mine_candidate_rules_tool(
+                    index_df,
+                    split_manifest,
+                    cfg,
+                    condition_spec,
+                    aircraft_ids=decision.aircraft_ids or _balanced_train_aircraft(index_df, split_manifest, min_n=4),
+                    max_flights_per_label_per_aircraft=3,
+                )
+            elif decision.action == "robust_normal_baseline":
+                result = robust_normal_baseline_tool(
+                    index_df,
+                    split_manifest,
+                    cfg,
+                    condition_spec,
+                    aircraft_ids=decision.aircraft_ids or _balanced_train_aircraft(index_df, split_manifest, min_n=4),
+                    max_flights_per_label_per_aircraft=3,
+                )
+            elif decision.action == "isolation_forest_windows":
+                result = isolation_forest_window_tool(
+                    index_df,
+                    split_manifest,
+                    cfg,
+                    condition_spec,
+                    aircraft_ids=decision.aircraft_ids or _balanced_train_aircraft(index_df, split_manifest, min_n=4),
+                    max_flights_per_label_per_aircraft=3,
+                    contamination=decision.contamination,
+                )
+            elif decision.action == "lag_correlation_flight":
+                flight_path, faulty_side, aid, label = _pick_training_flight(
+                    index_df,
+                    split_manifest,
+                    decision.aircraft_id,
+                    decision.folder_label,
+                    decision.flight_path,
+                )
+                result = lag_correlation_flight_tool(flight_path, faulty_side, max_lag=decision.max_lag)
+                result.update({"split_used": "train", "aircraft_id": aid, "folder_label": label})
+            elif decision.action == "change_point_flight":
+                flight_path, faulty_side, aid, label = _pick_training_flight(
+                    index_df,
+                    split_manifest,
+                    decision.aircraft_id,
+                    decision.folder_label,
+                    decision.flight_path,
+                )
+                result = change_point_flight_tool(
+                    flight_path,
+                    faulty_side,
+                    columns=decision.columns or None,
+                    penalty=decision.penalty,
+                )
+                result.update({"split_used": "train", "aircraft_id": aid, "folder_label": label})
+            elif decision.action == "matrix_profile_discords":
+                flight_path, faulty_side, aid, label = _pick_training_flight(
+                    index_df,
+                    split_manifest,
+                    decision.aircraft_id,
+                    decision.folder_label,
+                    decision.flight_path,
+                )
+                result = matrix_profile_discords_tool(
+                    flight_path,
+                    faulty_side,
+                    column=decision.column,
+                    subseq_len=decision.subseq_len,
+                    top_k=decision.top_k,
+                )
+                result.update({"split_used": "train", "aircraft_id": aid, "folder_label": label})
             elif decision.action == "test_rule":
-                rule = decision.rule_bundle or default_rule
+                rule = decision.rule_bundle or _best_candidate_rule_from_trace(trace, condition_spec) or default_rule
                 rule.condition_spec = condition_spec
                 aircraft_ids = decision.aircraft_ids or _balanced_train_aircraft(index_df, split_manifest, min_n=4)
+                aircraft_ids = _train_only_aircraft_ids(split_manifest, aircraft_ids)
+                if len(aircraft_ids) < 2:
+                    aircraft_ids = _balanced_train_aircraft(index_df, split_manifest, min_n=4)
                 result = _test_rule_on_aircraft(index_df, aircraft_ids, cfg, rule)
             elif decision.action == "finalize_rule":
-                rule = decision.rule_bundle or default_rule
+                rule = decision.rule_bundle or _best_candidate_rule_from_trace(trace, condition_spec) or default_rule
                 rule.condition_spec = condition_spec
                 if not rule.folder_vote_threshold:
                     rule.folder_vote_threshold = cfg.loop.folder_vote_threshold

@@ -33,6 +33,8 @@ class AgentToolLoopConfig(BaseModel):
 class SplitConfig(BaseModel):
     seed: int = 42
     train_aircraft_count: int = 10
+    validation_aircraft_count: int = 3
+    holdout_aircraft_count: int = 0
 
 
 class LoopConfig(BaseModel):
